@@ -14,8 +14,11 @@
 //   - All text input modes (InsertUrl, SearchMode, CategoryNameInput)
 //   - Detail view: g/G and Ctrl+u/Ctrl+d for scrolling
 
-use crate::app::{AddFeedResult, App, CategoryAction, InputMode, TimeFilter, TreeItem, View};
-use crate::keybindings::KeyAction;
+use crate::app::{
+    expand_argv_template, make_pipe_payload, AddFeedResult, App, CategoryAction, InputMode,
+    TimeFilter, TreeItem, View,
+};
+use crate::keybindings::{KeyAction, MacroBinding, StdinKind};
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -85,6 +88,82 @@ fn handle_toggle_read_current(app: &mut App) {
                     app.error = Some(format!("Failed to toggle read status: {}", e));
                 }
             }
+        }
+    }
+}
+
+// ── Macro engine ───────────────────────────────────────────────────
+//
+// Macros are checked at the top of `handle_key_event` and bypass the
+// per-view dispatch entirely. ALL steps (Action / PipeTo / Exec) are
+// queued onto `app.pending_macro_steps` so they run in newsboat-style
+// sequential order. The TUI loop drains the queue after each
+// event-handling pass — actions mutate state inline, PipeTo suspends
+// the terminal, Exec spawns detached.
+
+/// Queue every step of a macro for the TUI drain in order.
+fn run_macro(app: &mut App, mac: &MacroBinding) {
+    for step in &mac.steps {
+        app.pending_macro_steps.push(step.clone());
+    }
+}
+
+/// Build the (argv, stdin payload) tuple for a queued PipeTo step using
+/// the current article context. Returns None if no article is focused.
+pub(crate) fn build_pipe_invocation(
+    app: &App,
+    argv_template: &[String],
+    stdin: StdinKind,
+) -> Option<(Vec<String>, Vec<u8>)> {
+    let ctx = app.current_article_context()?;
+    let argv = expand_argv_template(argv_template, &ctx);
+    let payload = make_pipe_payload(&ctx, stdin);
+    Some((argv, payload))
+}
+
+/// Build the argv for a queued Exec step using the current article context.
+/// Returns None if no article is focused.
+pub(crate) fn build_exec_invocation(app: &App, argv_template: &[String]) -> Option<Vec<String>> {
+    let ctx = app.current_article_context()?;
+    Some(expand_argv_template(argv_template, &ctx))
+}
+
+/// Run a `KeyAction` outside of normal key dispatch (called from the
+/// macro queue drain). Only a curated subset is supported — actions whose
+/// meaning is well-defined without view-specific input mode context.
+pub(crate) fn dispatch_action(app: &mut App, action: KeyAction) {
+    match action {
+        KeyAction::Refresh => handle_refresh(app),
+        KeyAction::ToggleTheme => handle_toggle_theme(app),
+        KeyAction::Help => handle_show_help(app),
+        KeyAction::ToggleStar => handle_toggle_star_current(app),
+        KeyAction::ToggleRead => handle_toggle_read_current(app),
+        KeyAction::OpenInBrowser => match app.current_article_context() {
+            Some(ctx) => {
+                if let Some(url) = ctx.url {
+                    if let Err(e) = open::that(url) {
+                        app.error = Some(format!("Failed to open link: {}", e));
+                    }
+                } else {
+                    app.error = Some("No URL on this article".to_string());
+                }
+            }
+            None => app.error = Some("open-in-browser: no article in focus".to_string()),
+        },
+        KeyAction::MarkAllRead => match app.mark_all_dashboard_read() {
+            Ok(count) => {
+                app.success_message = Some(format!("\u{2713} Marked {} items as read", count));
+                app.success_message_time = Some(std::time::Instant::now());
+                app.apply_filters();
+            }
+            Err(e) => app.error = Some(format!("Failed to mark all read: {}", e)),
+        },
+        KeyAction::ExtractLinks => app.extract_links_from_current_item(),
+        other => {
+            app.error = Some(format!(
+                "macro: action '{:?}' not supported in macros",
+                other
+            ));
         }
     }
 }
@@ -164,6 +243,32 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
     if app.key_matches(KeyAction::ForceQuit, &key) {
         return Ok(true);
     }
+
+    // Macro engine: handle the macro-prefix follow-up key, then check whether
+    // this key IS the macro prefix. Only active in Normal input mode so it
+    // never interferes with text-input or filter-cycling modes.
+    if app.input_mode == InputMode::Normal {
+        if app.awaiting_macro_key {
+            app.awaiting_macro_key = false;
+            match app.macro_for_key(&key) {
+                Some(mac) => {
+                    let mac = mac.clone();
+                    run_macro(app, &mac);
+                }
+                None => {
+                    app.error = Some("No macro bound to that key".to_string());
+                }
+            }
+            return Ok(false);
+        }
+        if app.macro_options.prefix.matches(&key) && !app.macros.is_empty() {
+            app.awaiting_macro_key = true;
+            app.success_message = Some("Macro prefix... press macro key".to_string());
+            app.success_message_time = Some(std::time::Instant::now());
+            return Ok(false);
+        }
+    }
+
     match app.input_mode {
         InputMode::Normal => match app.view {
             View::Dashboard => match key.code {

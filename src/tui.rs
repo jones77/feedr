@@ -2,7 +2,7 @@ use crate::app::{App, View};
 use crate::events::handle_events;
 use crate::feed::Feed;
 use crate::ui;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -12,8 +12,100 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::{io, time::Duration};
+
+/// RAII guard that re-enters the alt-screen + raw mode + mouse capture on drop,
+/// so a panic during a pipe-to child invocation cannot leave the terminal in
+/// a broken state.
+struct TerminalRestoreGuard;
+
+impl TerminalRestoreGuard {
+    fn enter() -> io::Result<Self> {
+        // Leave the TUI before handing the tty to the child.
+        let mut stdout = io::stdout();
+        execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+        disable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        // Best-effort restore — ignore errors during unwind.
+        let _ = enable_raw_mode();
+        let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    }
+}
+
+/// Suspend the TUI, run argv with the given stdin payload (or inherited stdin
+/// if `stdin_payload` is None), then re-enter the TUI and force a redraw.
+/// Drains any pending terminal events so terminal-probe responses from the
+/// child don't leak into our key handler.
+pub fn suspend_for_command<B: Backend>(
+    terminal: &mut Terminal<B>,
+    argv: &[String],
+    stdin_payload: Option<&[u8]>,
+) -> Result<std::process::ExitStatus> {
+    if argv.is_empty() {
+        anyhow::bail!("empty command");
+    }
+    let status = {
+        let _guard = TerminalRestoreGuard::enter()?;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if stdin_payload.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        // stdout/stderr inherited so user sees output of the child.
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn '{}'", argv[0]))?;
+        if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
+            stdin.write_all(payload).ok();
+            // Dropping `stdin` here closes the pipe so the child sees EOF.
+        }
+        child.wait().context("failed to wait for child")?
+    };
+    // Drain any pending input that might have arrived during the child's run
+    // (e.g. terminal-probe responses from less/vim).
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read();
+    }
+    terminal.clear()?;
+    Ok(status)
+}
+
+/// Spawn a child detached: stdio nulled, no wait. The Child is dropped — on
+/// Linux the OS reaps it after parent exit. Used by exec_on_new where we
+/// fan out potentially many children and must not block the main loop.
+pub fn spawn_detached(argv: &[String], stdin_payload: Option<Vec<u8>>) -> Result<()> {
+    if argv.is_empty() {
+        anyhow::bail!("empty command");
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if stdin_payload.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn '{}'", argv[0]))?;
+    if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
+        // Best-effort write; closing stdin happens when the handle drops.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
+    }
+    // Intentionally do not wait — child becomes orphaned, OS reaps on parent exit.
+    Ok(())
+}
 
 pub fn run(mut app: App) -> Result<()> {
     // Set up terminal
@@ -41,6 +133,99 @@ pub fn run(mut app: App) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Drain all queued macro steps in FIFO order. Action steps mutate app
+/// state inline, PipeTo suspends the terminal for a blocking child, Exec
+/// spawns detached. On the first error the rest of the queue is dropped
+/// to avoid running a follow-up step in an undefined state.
+fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
+    use crate::keybindings::MacroStep;
+    while !app.pending_macro_steps.is_empty() {
+        let step = app.pending_macro_steps.remove(0);
+        match step {
+            MacroStep::Action(a) => crate::events::dispatch_action(app, a),
+            MacroStep::PipeTo {
+                argv_template,
+                stdin,
+            } => {
+                let (argv, payload) =
+                    match crate::events::build_pipe_invocation(app, &argv_template, stdin) {
+                        Some(v) => v,
+                        None => {
+                            app.error = Some("pipe-to: no article in focus".to_string());
+                            app.pending_macro_steps.clear();
+                            break;
+                        }
+                    };
+                if let Err(e) = suspend_for_command(terminal, &argv, Some(&payload)) {
+                    app.error = Some(format!("pipe-to: {}", e));
+                    app.pending_macro_steps.clear();
+                    break;
+                }
+            }
+            MacroStep::Exec { argv_template } => {
+                let argv = match crate::events::build_exec_invocation(app, &argv_template) {
+                    Some(v) => v,
+                    None => {
+                        app.error = Some("exec: no article in focus".to_string());
+                        app.pending_macro_steps.clear();
+                        break;
+                    }
+                };
+                if let Err(e) = spawn_detached(&argv, None) {
+                    app.error = Some(format!("exec: {}", e));
+                }
+            }
+        }
+    }
+}
+
+/// Diff a freshly-arrived feed against `app.seen_items` and fire the
+/// `[hooks].exec_on_new` template (if configured) for each genuinely-new item.
+/// On the first successful fetch of a feed (URL not yet in `feeds_seeded`),
+/// seed the seen set silently to suppress the firehose.
+fn fire_exec_on_new(app: &mut App, feed: &Feed) {
+    let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
+    if newly_seen_idx.is_empty() {
+        return;
+    }
+    let template_str = match app.config.hooks.exec_on_new.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => return,
+    };
+    let argv_template = match shlex::split(&template_str) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            app.error = Some(format!(
+                "exec_on_new: could not tokenize template: {}",
+                template_str
+            ));
+            return;
+        }
+    };
+    for idx in newly_seen_idx {
+        let item = match feed.items.get(idx) {
+            Some(i) => i,
+            None => continue,
+        };
+        let ctx = crate::app::ArticleContext {
+            title: &item.title,
+            url: item.link.as_deref(),
+            author: item.author.as_deref(),
+            formatted_date: item.formatted_date.as_deref(),
+            feed_title: &feed.title,
+            feed_url: &feed.url,
+            plain_text: item.plain_text.as_deref(),
+        };
+        let argv = crate::app::expand_argv_template(&argv_template, &ctx);
+        if let Err(e) = spawn_detached(&argv, None) {
+            // Show the first failure; subsequent ones are suppressed.
+            if app.error.is_none() {
+                app.error = Some(format!("exec_on_new: {}", e));
+            }
+        }
+    }
 }
 
 /// Spawn background threads to fetch all bookmarked feeds, sending results through the channel.
@@ -107,6 +292,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         if pending_count > 0 {
             while let Ok((idx, result)) = feed_rx.try_recv() {
                 if let Ok(feed) = result {
+                    fire_exec_on_new(app, &feed);
                     // Insert at the correct position to maintain bookmark order,
                     // or append if earlier feeds haven't arrived yet
                     let insert_pos = app
@@ -165,6 +351,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             if handle_events(app)? {
                 return Ok(());
             }
+            drain_macro_steps(terminal, app);
         } else if last_tick.elapsed() >= tick_rate {
             // Update animation frame on tick
             if app.is_loading {

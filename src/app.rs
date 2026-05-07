@@ -120,6 +120,33 @@ pub struct App {
     pub feed_tree: Vec<TreeItem>,
     pub selected_tree_item: Option<usize>, // index into feed_tree
     pub keybindings: crate::keybindings::KeyBindingMap,
+    pub macros: Vec<crate::keybindings::MacroBinding>,
+    pub macro_options: crate::keybindings::MacroOptions,
+    /// True after the macro-prefix key has been pressed and we are awaiting the next key.
+    pub awaiting_macro_key: bool,
+    /// Item IDs that exec_on_new has already fired for (persisted).
+    pub seen_items: HashSet<String>,
+    /// Feed URLs whose first successful fetch has been observed (persisted).
+    pub feeds_seeded: HashSet<String>,
+    /// FIFO queue of macro steps awaiting execution. Filled by the macro
+    /// engine in `events.rs`; drained in order by the TUI run loop after
+    /// each event-handling pass. Steps include Actions (which mutate app
+    /// state) and PipeTo/Exec (which spawn children). Draining happens at
+    /// the loop level because PipeTo needs the terminal handle to suspend
+    /// the TUI, which `handle_events` does not have access to.
+    pub pending_macro_steps: Vec<crate::keybindings::MacroStep>,
+}
+
+/// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
+#[derive(Clone, Debug)]
+pub struct ArticleContext<'a> {
+    pub title: &'a str,
+    pub url: Option<&'a str>,
+    pub author: Option<&'a str>,
+    pub formatted_date: Option<&'a str>,
+    pub feed_title: &'a str,
+    pub feed_url: &'a str,
+    pub plain_text: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +192,13 @@ struct SavedData {
     starred_items: HashSet<String>,
     #[serde(default)]
     last_session_time: Option<String>,
+    /// Item IDs (same scheme as `read_items`) that exec_on_new has already fired for.
+    #[serde(default)]
+    seen_items: HashSet<String>,
+    /// Feed URLs whose first successful fetch has been observed. Items from a
+    /// feed not in this set are seeded into `seen_items` silently.
+    #[serde(default)]
+    feeds_seeded: HashSet<String>,
 }
 
 impl Default for App {
@@ -187,6 +221,8 @@ impl App {
             read_items: HashSet::new(),
             starred_items: HashSet::new(),
             last_session_time: None,
+            seen_items: HashSet::new(),
+            feeds_seeded: HashSet::new(),
         });
 
         // Seed bookmarks from default_feeds if no saved bookmarks exist
@@ -222,6 +258,12 @@ impl App {
         let show_summary = last_session_time.is_some() && has_bookmarks;
 
         let (keybindings, kb_warnings) = crate::keybindings::build_keybindings(&config.keybindings);
+        let (macro_options, mo_warnings) = crate::keybindings::resolve_macro_options(
+            &config.macro_options.prefix,
+            &config.macro_options.pipe_default_stdin,
+        );
+        let (macros, mac_warnings) =
+            crate::keybindings::build_macros(&config.macros, &macro_options);
 
         let mut app = Self {
             config,
@@ -275,13 +317,22 @@ impl App {
             feed_tree: Vec::new(),
             selected_tree_item: None,
             keybindings,
+            macros,
+            macro_options,
+            awaiting_macro_key: false,
+            seen_items: saved_data.seen_items,
+            feeds_seeded: saved_data.feeds_seeded,
+            pending_macro_steps: Vec::new(),
         };
 
         app.update_dashboard();
         app.rebuild_feed_tree();
 
-        if !kb_warnings.is_empty() {
-            app.error = Some(format!("Keybinding config: {}", kb_warnings.join("; ")));
+        let mut all_warnings = kb_warnings;
+        all_warnings.extend(mo_warnings);
+        all_warnings.extend(mac_warnings);
+        if !all_warnings.is_empty() {
+            app.error = Some(format!("Config: {}", all_warnings.join("; ")));
         }
 
         app
@@ -354,6 +405,8 @@ impl App {
                 read_items: HashSet::new(),
                 starred_items: HashSet::new(),
                 last_session_time: None,
+                seen_items: HashSet::new(),
+                feeds_seeded: HashSet::new(),
             });
         }
 
@@ -374,6 +427,8 @@ impl App {
             read_items: self.read_items.clone(),
             starred_items: self.starred_items.clone(),
             last_session_time: Some(Utc::now().to_rfc3339()),
+            seen_items: self.seen_items.clone(),
+            feeds_seeded: self.feeds_seeded.clone(),
         };
 
         let json = serde_json::to_string(&saved_data)?;
@@ -598,10 +653,7 @@ impl App {
     pub(crate) fn get_item_id(&self, feed_idx: usize, item_idx: usize) -> String {
         if let Some(feed) = self.feeds.get(feed_idx) {
             if let Some(item) = feed.items.get(item_idx) {
-                if let Some(link) = &item.link {
-                    return link.clone();
-                }
-                return format!("{}_{}", feed.url, item.title);
+                return make_item_id(feed, item);
             }
         }
         String::new()
@@ -1549,6 +1601,166 @@ impl App {
             self.error = Some("No links or images found in this article".to_string());
         }
     }
+
+    /// Resolve the focused article based on the current view + selection.
+    /// Returns None if nothing is selected or the indices don't resolve.
+    pub fn current_article_context(&self) -> Option<ArticleContext<'_>> {
+        let (feed_idx, item_idx) = match self.view {
+            View::Dashboard => {
+                let sel = self.selected_item?;
+                let active = self.active_dashboard_items();
+                if sel >= active.len() {
+                    return None;
+                }
+                active[sel]
+            }
+            View::FeedItems | View::FeedItemDetail => {
+                let feed_idx = self.selected_feed?;
+                let item_idx = self.selected_item?;
+                (feed_idx, item_idx)
+            }
+            View::Starred => {
+                let sel = self.selected_item?;
+                let starred = self.get_starred_dashboard_items();
+                if sel >= starred.len() {
+                    return None;
+                }
+                starred[sel]
+            }
+            _ => return None,
+        };
+        let feed = self.feeds.get(feed_idx)?;
+        let item = feed.items.get(item_idx)?;
+        Some(ArticleContext {
+            title: &item.title,
+            url: item.link.as_deref(),
+            author: item.author.as_deref(),
+            formatted_date: item.formatted_date.as_deref(),
+            feed_title: &feed.title,
+            feed_url: &feed.url,
+            plain_text: item.plain_text.as_deref(),
+        })
+    }
+
+    /// Look up a macro whose trigger matches the given key event.
+    pub fn macro_for_key(
+        &self,
+        key: &crossterm::event::KeyEvent,
+    ) -> Option<&crate::keybindings::MacroBinding> {
+        self.macros.iter().find(|m| m.trigger.matches(key))
+    }
+}
+
+/// Build the same identifier scheme used by `read_items`/`starred_items` from
+/// a feed + item that may not yet be in `App::feeds`.
+pub fn make_item_id(feed: &Feed, item: &FeedItem) -> String {
+    if let Some(link) = &item.link {
+        return link.clone();
+    }
+    format!("{}_{}", feed.url, item.title)
+}
+
+/// Update `seen_items` and `feeds_seeded` to reflect this feed having been
+/// successfully fetched. Returns the indices into `feed.items` of items
+/// that are newly seen *and should fire exec_on_new*. On the first
+/// successful fetch of a feed (URL not yet in `feeds_seeded`), the seen
+/// set is populated silently and an empty Vec is returned.
+pub fn mark_feed_seen(app: &mut App, feed: &Feed) -> Vec<usize> {
+    let is_first_fetch = !app.feeds_seeded.contains(&feed.url);
+    let mut newly_seen = Vec::new();
+    for (idx, item) in feed.items.iter().enumerate() {
+        let id = make_item_id(feed, item);
+        let inserted = app.seen_items.insert(id);
+        if inserted && !is_first_fetch {
+            newly_seen.push(idx);
+        }
+    }
+    if is_first_fetch {
+        app.feeds_seeded.insert(feed.url.clone());
+    }
+    newly_seen
+}
+
+/// Substitute newsboat-style %X placeholders into each argv token. Untrusted
+/// content is never interpreted by a shell — placeholders are inserted
+/// verbatim into individual argv elements.
+///
+/// Variables: %t title, %u url, %a author, %d formatted-date,
+///            %f feed-title, %F feed-url, %% literal %.
+pub fn expand_argv_template(template: &[String], ctx: &ArticleContext<'_>) -> Vec<String> {
+    template
+        .iter()
+        .map(|tok| expand_one_token(tok, ctx))
+        .collect()
+}
+
+fn expand_one_token(tok: &str, ctx: &ArticleContext<'_>) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut chars = tok.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('t') => out.push_str(ctx.title),
+            Some('u') => out.push_str(ctx.url.unwrap_or("")),
+            Some('a') => out.push_str(ctx.author.unwrap_or("")),
+            Some('d') => out.push_str(ctx.formatted_date.unwrap_or("")),
+            Some('f') => out.push_str(ctx.feed_title),
+            Some('F') => out.push_str(ctx.feed_url),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Build the byte payload that gets piped to a `pipe-to` child's stdin.
+pub fn make_pipe_payload(ctx: &ArticleContext<'_>, kind: crate::keybindings::StdinKind) -> Vec<u8> {
+    use crate::keybindings::StdinKind;
+    match kind {
+        StdinKind::None => Vec::new(),
+        StdinKind::Title => ctx.title.as_bytes().to_vec(),
+        StdinKind::Url => ctx.url.unwrap_or("").as_bytes().to_vec(),
+        StdinKind::Body => ctx
+            .plain_text
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default(),
+        StdinKind::Metadata => {
+            let mut out = String::new();
+            out.push_str("Title: ");
+            out.push_str(ctx.title);
+            out.push('\n');
+            if let Some(u) = ctx.url {
+                out.push_str("URL: ");
+                out.push_str(u);
+                out.push('\n');
+            }
+            if let Some(a) = ctx.author {
+                out.push_str("Author: ");
+                out.push_str(a);
+                out.push('\n');
+            }
+            if let Some(d) = ctx.formatted_date {
+                out.push_str("Date: ");
+                out.push_str(d);
+                out.push('\n');
+            }
+            out.push_str("Feed: ");
+            out.push_str(ctx.feed_title);
+            out.push('\n');
+            out.push('\n');
+            if let Some(body) = ctx.plain_text {
+                out.push_str(body);
+            }
+            out.into_bytes()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2044,5 +2256,157 @@ mod tests {
 
         assert_eq!(app.extracted_links.len(), 1);
         assert_eq!(app.extracted_links[0].url, "https://example.com/about");
+    }
+
+    fn synthetic_ctx() -> ArticleContext<'static> {
+        ArticleContext {
+            title: "Hello %u world",
+            url: Some("https://ex.com/a"),
+            author: Some("Alice"),
+            formatted_date: Some("2 hours ago"),
+            feed_title: "Example",
+            feed_url: "https://ex.com/feed.xml",
+            plain_text: Some("body text"),
+        }
+    }
+
+    #[test]
+    fn test_expand_argv_template_per_token() {
+        let tmpl = vec![
+            "yt-dlp".to_string(),
+            "%u".to_string(),
+            "--title=%t".to_string(),
+        ];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx());
+        assert_eq!(argv[0], "yt-dlp");
+        // The url replaces %u literally — but the title contains a %u which
+        // must NOT be re-expanded (we only expand once, in the template, not
+        // in the substituted content).
+        assert_eq!(argv[1], "https://ex.com/a");
+        assert_eq!(argv[2], "--title=Hello %u world");
+    }
+
+    #[test]
+    fn test_expand_argv_template_percent_literal_and_unknown() {
+        let tmpl = vec!["a%%b".to_string(), "x%zy".to_string()];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx());
+        assert_eq!(argv[0], "a%b");
+        // Unknown escapes are passed through verbatim.
+        assert_eq!(argv[1], "x%zy");
+    }
+
+    #[test]
+    fn test_make_pipe_payload_kinds() {
+        use crate::keybindings::StdinKind;
+        let ctx = synthetic_ctx();
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::None), Vec::<u8>::new());
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Title), b"Hello %u world");
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Url), b"https://ex.com/a");
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Body), b"body text");
+        let metadata = make_pipe_payload(&ctx, StdinKind::Metadata);
+        let s = String::from_utf8(metadata).unwrap();
+        assert!(s.contains("Title: Hello %u world"));
+        assert!(s.contains("URL: https://ex.com/a"));
+        assert!(s.contains("Author: Alice"));
+        assert!(s.contains("Feed: Example"));
+        assert!(s.ends_with("body text"));
+    }
+
+    fn synthetic_feed(url: &str, item_titles: &[&str]) -> Feed {
+        let items = item_titles
+            .iter()
+            .map(|t| FeedItem {
+                title: t.to_string(),
+                link: Some(format!("https://ex.com/a/{}", t)),
+                description: None,
+                pub_date: None,
+                author: None,
+                formatted_date: None,
+                parsed_date: None,
+                plain_text: None,
+                title_lower: t.to_lowercase(),
+            })
+            .collect();
+        Feed {
+            url: url.to_string(),
+            title: "Example".to_string(),
+            items,
+            title_lower: "example".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_mark_feed_seen_first_fetch_seeds_silently() {
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+
+        let newly = mark_feed_seen(&mut app, &feed);
+        assert!(
+            newly.is_empty(),
+            "first fetch must return no newly-seen items"
+        );
+        assert_eq!(app.seen_items.len(), 3);
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+    }
+
+    #[test]
+    fn test_mark_feed_seen_second_fetch_returns_only_new() {
+        let mut app = App::new();
+        let feed_v1 = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        mark_feed_seen(&mut app, &feed_v1);
+
+        let feed_v2 = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C", "D"]);
+        let newly = mark_feed_seen(&mut app, &feed_v2);
+        // Indices 2 and 3 (C, D) are new; A and B are already seen.
+        assert_eq!(newly, vec![2, 3]);
+        assert_eq!(app.seen_items.len(), 4);
+    }
+
+    #[test]
+    fn test_mark_feed_seen_no_changes_returns_empty() {
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        mark_feed_seen(&mut app, &feed);
+        let newly = mark_feed_seen(&mut app, &feed);
+        assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn test_mark_feed_seen_distinct_feeds_independent() {
+        let mut app = App::new();
+        let feed_a = synthetic_feed("https://ex.com/a.xml", &["A1"]);
+        let feed_b = synthetic_feed("https://ex.com/b.xml", &["B1"]);
+        // First fetches both seed silently.
+        assert!(mark_feed_seen(&mut app, &feed_a).is_empty());
+        assert!(mark_feed_seen(&mut app, &feed_b).is_empty());
+        assert!(app.feeds_seeded.contains("https://ex.com/a.xml"));
+        assert!(app.feeds_seeded.contains("https://ex.com/b.xml"));
+    }
+
+    #[test]
+    fn test_make_item_id_prefers_link() {
+        let mut feed = Feed {
+            url: "https://ex.com/feed.xml".to_string(),
+            title: "Example".to_string(),
+            items: vec![],
+            title_lower: "example".to_string(),
+        };
+        let item = FeedItem {
+            title: "T".to_string(),
+            link: Some("https://ex.com/a".to_string()),
+            description: None,
+            pub_date: None,
+            author: None,
+            formatted_date: None,
+            parsed_date: None,
+            plain_text: None,
+            title_lower: "t".to_string(),
+        };
+        feed.items.push(item.clone());
+        assert_eq!(make_item_id(&feed, &item), "https://ex.com/a");
+        let mut item2 = item.clone();
+        item2.link = None;
+        item2.title = "T2".to_string();
+        assert_eq!(make_item_id(&feed, &item2), "https://ex.com/feed.xml_T2");
     }
 }
