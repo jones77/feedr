@@ -1429,7 +1429,7 @@ impl App {
             .into_iter()
             .map(|(name, count)| (name.to_string(), count))
             .collect();
-        feeds_with_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        feeds_with_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         (total, feeds_with_counts)
     }
@@ -1683,6 +1683,39 @@ mod tests {
         assert_eq!(feeds[0].1, 2);
         assert_eq!(feeds[1].0, "Feed Two");
         assert_eq!(feeds[1].1, 1);
+    }
+
+    #[test]
+    fn test_get_summary_stats_tie_break_by_name() {
+        let mut app = make_test_app();
+        // Add a third feed whose name sorts before "Feed Two" but ties on count
+        app.feeds.push(Feed {
+            url: "https://example.com/feed3".to_string(),
+            title: "Alpha Feed".to_string(),
+            title_lower: "alpha feed".to_string(),
+            items: vec![FeedItem {
+                title: "Alpha New".to_string(),
+                title_lower: "alpha new".to_string(),
+                link: Some("https://example.com/alpha".to_string()),
+                description: Some("Alpha content".to_string()),
+                pub_date: None,
+                author: None,
+                formatted_date: None,
+                parsed_date: Some(Utc::now() - chrono::Duration::hours(3)),
+                plain_text: Some("Alpha content".to_string()),
+            }],
+        });
+        app.last_session_time = Some(Utc::now() - chrono::Duration::days(365));
+
+        // Run twice — order must be identical across calls regardless of HashMap iteration.
+        let (_, first) = app.get_summary_stats();
+        let (_, second) = app.get_summary_stats();
+        assert_eq!(first, second);
+
+        // Feed One leads on count; "Alpha Feed" beats "Feed Two" alphabetically on the tie.
+        assert_eq!(first[0], ("Feed One".to_string(), 2));
+        assert_eq!(first[1], ("Alpha Feed".to_string(), 1));
+        assert_eq!(first[2], ("Feed Two".to_string(), 1));
     }
 
     #[test]

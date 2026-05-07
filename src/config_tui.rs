@@ -415,6 +415,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::collapsible_match)]
 fn run_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     editor: &mut ConfigEditor,
