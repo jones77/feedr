@@ -105,6 +105,11 @@ pub(crate) fn handle_events(app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+// Inner `if` blocks inside match arms are intentional. Collapsing them into match
+// guards (as `clippy::collapsible_match` suggests) would change behavior for the
+// hardcoded `1`/`2`/`3` demo-feed shortcuts, since unmatched arms fall through to
+// the configurable-keybinding guard arms.
+#[allow(clippy::collapsible_match)]
 pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -> Result<bool> {
     if matches!(key.kind, KeyEventKind::Release) {
         return Ok(false);
@@ -1191,6 +1196,7 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
     Ok(false)
 }
 
+#[allow(clippy::collapsible_match)]
 fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<bool> {
     // Dismiss overlays on any click
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
