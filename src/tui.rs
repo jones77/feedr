@@ -63,11 +63,24 @@ pub fn suspend_for_command<B: Backend>(
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn '{}'", argv[0]))?;
-        if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
-            stdin.write_all(payload).ok();
-            // Dropping `stdin` here closes the pipe so the child sees EOF.
+        // Write the stdin payload from a dedicated thread so a payload larger
+        // than the pipe buffer (typically 64 KiB on Linux) cannot deadlock the
+        // parent against a child that hasn't started reading yet.
+        let writer = match (stdin_payload, child.stdin.take()) {
+            (Some(payload), Some(mut stdin)) => {
+                let payload = payload.to_vec();
+                Some(std::thread::spawn(move || {
+                    let _ = stdin.write_all(&payload);
+                    // stdin drops here, closing the pipe so the child sees EOF.
+                }))
+            }
+            _ => None,
+        };
+        let status = child.wait().context("failed to wait for child")?;
+        if let Some(w) = writer {
+            let _ = w.join();
         }
-        child.wait().context("failed to wait for child")?
+        status
     };
     // Drain any pending input that might have arrived during the child's run
     // (e.g. terminal-probe responses from less/vim).
@@ -78,32 +91,26 @@ pub fn suspend_for_command<B: Backend>(
     Ok(status)
 }
 
-/// Spawn a child detached: stdio nulled, no wait. The Child is dropped — on
-/// Linux the OS reaps it after parent exit. Used by exec_on_new where we
-/// fan out potentially many children and must not block the main loop.
-pub fn spawn_detached(argv: &[String], stdin_payload: Option<Vec<u8>>) -> Result<()> {
+/// Spawn a child detached: stdio nulled, parent does not block. A reaper
+/// thread waits on the child so it doesn't linger as a zombie for the
+/// lifetime of the TUI session — `Child` left undropped on Unix would
+/// otherwise stay `<defunct>` until parent exit. Used by exec_on_new where
+/// we may fan out many children and must not block the main loop.
+pub fn spawn_detached(argv: &[String]) -> Result<()> {
     if argv.is_empty() {
         anyhow::bail!("empty command");
     }
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if stdin_payload.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", argv[0]))?;
-    if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
-        // Best-effort write; closing stdin happens when the handle drops.
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
-    }
-    // Intentionally do not wait — child becomes orphaned, OS reaps on parent exit.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -172,7 +179,7 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
                         break;
                     }
                 };
-                if let Err(e) = spawn_detached(&argv, None) {
+                if let Err(e) = spawn_detached(&argv) {
                     app.error = Some(format!("exec: {}", e));
                 }
             }
@@ -189,7 +196,15 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
 /// AT MOST ONCE: a kill between persist and spawn loses a notification, but a
 /// later restart never re-fires the same item. This matters for side-effecting
 /// hooks like `wallabag-cli add`.
+///
+/// No-op when the hook is not configured. seen_items / feeds_seeded only
+/// exist to drive this hook, so users who never opt in pay neither the
+/// memory cost nor the per-feed save_data round-trip.
 fn fire_exec_on_new(app: &mut App, feed: &Feed) {
+    let argv_template = match app.exec_on_new_template.as_ref() {
+        Some(t) => t.clone(),
+        None => return,
+    };
     let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
     if newly_seen_idx.is_empty() {
         return;
@@ -198,11 +213,6 @@ fn fire_exec_on_new(app: &mut App, feed: &Feed) {
     // spawning, the user misses a notification — preferable to a duplicate
     // for side-effecting hooks.
     let _ = app.save_data();
-
-    let argv_template = match app.exec_on_new_template.as_ref() {
-        Some(t) => t.clone(),
-        None => return,
-    };
     let mut first_failure_recorded = false;
     for idx in newly_seen_idx {
         let item = match feed.items.get(idx) {
@@ -211,7 +221,7 @@ fn fire_exec_on_new(app: &mut App, feed: &Feed) {
         };
         let ctx = crate::app::article_context_from(feed, item);
         let argv = crate::app::expand_argv_template(&argv_template, &ctx);
-        if let Err(e) = spawn_detached(&argv, None) {
+        if let Err(e) = spawn_detached(&argv) {
             if !first_failure_recorded {
                 app.error = Some(format!("exec_on_new: {}", e));
                 first_failure_recorded = true;

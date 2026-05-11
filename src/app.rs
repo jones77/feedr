@@ -124,9 +124,9 @@ pub struct App {
     pub macro_options: crate::keybindings::MacroOptions,
     /// True after the macro-prefix key has been pressed and we are awaiting the next key.
     pub awaiting_macro_key: bool,
-    /// When `awaiting_macro_key` was last set, so the TUI tick loop can time it
-    /// out after `macro_prefix_timeout` rather than stranding the prefix state
-    /// across an idle period.
+    /// When `awaiting_macro_key` was last set, so the TUI tick loop can time
+    /// it out (reusing the 1.5 s success-message timeout) rather than
+    /// stranding the prefix state across an idle period.
     pub awaiting_macro_key_since: Option<Instant>,
     /// Item IDs that exec_on_new has already fired for (persisted).
     pub seen_items: HashSet<String>,
@@ -1631,22 +1631,23 @@ impl App {
         }
     }
 
-    /// Resolve the focused article based on the current view + selection.
-    /// Returns None if nothing is selected or the indices don't resolve.
-    pub fn current_article_context(&self) -> Option<ArticleContext<'_>> {
-        let (feed_idx, item_idx) = match self.view {
+    /// Resolve `(feed_idx, item_idx)` for the focused article in the current
+    /// view. Dashboard and Starred views derive the indices from their derived
+    /// item list rather than from `selected_feed` (which is only populated
+    /// once the user drills into FeedItems / FeedItemDetail). This is the
+    /// single source of truth for "which item is focused right now".
+    pub fn current_article_indices(&self) -> Option<(usize, usize)> {
+        match self.view {
             View::Dashboard => {
                 let sel = self.selected_item?;
                 let active = self.active_dashboard_items();
                 if sel >= active.len() {
                     return None;
                 }
-                active[sel]
+                Some(active[sel])
             }
             View::FeedItems | View::FeedItemDetail => {
-                let feed_idx = self.selected_feed?;
-                let item_idx = self.selected_item?;
-                (feed_idx, item_idx)
+                Some((self.selected_feed?, self.selected_item?))
             }
             View::Starred => {
                 let sel = self.selected_item?;
@@ -1654,10 +1655,16 @@ impl App {
                 if sel >= starred.len() {
                     return None;
                 }
-                starred[sel]
+                Some(starred[sel])
             }
-            _ => return None,
-        };
+            _ => None,
+        }
+    }
+
+    /// Resolve the focused article based on the current view + selection.
+    /// Returns None if nothing is selected or the indices don't resolve.
+    pub fn current_article_context(&self) -> Option<ArticleContext<'_>> {
+        let (feed_idx, item_idx) = self.current_article_indices()?;
         let feed = self.feeds.get(feed_idx)?;
         let item = feed.items.get(item_idx)?;
         Some(ArticleContext {

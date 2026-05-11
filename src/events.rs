@@ -53,41 +53,39 @@ fn handle_show_help(app: &mut App) {
 }
 
 fn handle_toggle_star_current(app: &mut App) {
-    if let Some(feed_idx) = app.selected_feed {
-        if let Some(item_idx) = app.selected_item {
-            match app.toggle_item_starred(feed_idx, item_idx) {
-                Ok(is_now_starred) => {
-                    app.success_message = Some(if is_now_starred {
-                        "\u{2605} Starred".to_string()
-                    } else {
-                        "\u{2606} Unstarred".to_string()
-                    });
-                    app.success_message_time = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    app.error = Some(format!("Failed to toggle star: {}", e));
-                }
-            }
+    let Some((feed_idx, item_idx)) = app.current_article_indices() else {
+        return;
+    };
+    match app.toggle_item_starred(feed_idx, item_idx) {
+        Ok(is_now_starred) => {
+            app.success_message = Some(if is_now_starred {
+                "\u{2605} Starred".to_string()
+            } else {
+                "\u{2606} Unstarred".to_string()
+            });
+            app.success_message_time = Some(std::time::Instant::now());
+        }
+        Err(e) => {
+            app.error = Some(format!("Failed to toggle star: {}", e));
         }
     }
 }
 
 fn handle_toggle_read_current(app: &mut App) {
-    if let Some(feed_idx) = app.selected_feed {
-        if let Some(item_idx) = app.selected_item {
-            match app.toggle_item_read(feed_idx, item_idx) {
-                Ok(is_now_read) => {
-                    app.success_message = Some(if is_now_read {
-                        "\u{2713} Marked as read".to_string()
-                    } else {
-                        "\u{25CB} Marked as unread".to_string()
-                    });
-                    app.success_message_time = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    app.error = Some(format!("Failed to toggle read status: {}", e));
-                }
-            }
+    let Some((feed_idx, item_idx)) = app.current_article_indices() else {
+        return;
+    };
+    match app.toggle_item_read(feed_idx, item_idx) {
+        Ok(is_now_read) => {
+            app.success_message = Some(if is_now_read {
+                "\u{2713} Marked as read".to_string()
+            } else {
+                "\u{25CB} Marked as unread".to_string()
+            });
+            app.success_message_time = Some(std::time::Instant::now());
+        }
+        Err(e) => {
+            app.error = Some(format!("Failed to toggle read status: {}", e));
         }
     }
 }
@@ -2013,5 +2011,60 @@ mod tests {
         handle_key_event(&mut app, y).unwrap();
         assert!(!app.awaiting_macro_key);
         assert_eq!(app.pending_macro_steps.len(), 2);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_star_works_in_dashboard_view() {
+        // Regression: dispatch_action used to read app.selected_feed, which is
+        // None in Dashboard view until the user drills into an item. The macro
+        // path silently no-op'd. After the fix, the focused dashboard item is
+        // resolved via current_article_indices() and toggling works.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        app.view = View::Dashboard;
+        app.selected_item = Some(0);
+        assert!(app.selected_feed.is_none(), "precondition for regression");
+        assert!(
+            !app.active_dashboard_items().is_empty(),
+            "make_test_app populates the dashboard"
+        );
+
+        dispatch_action(&mut app, KeyAction::ToggleStar);
+
+        assert_eq!(
+            app.starred_items.len(),
+            1,
+            "expected item to be starred via dispatch_action"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_read_works_in_starred_view() {
+        // Regression: same root cause as the Dashboard case — Starred view
+        // also leaves selected_feed unset.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        // Star one item so the Starred view has something to focus on.
+        app.toggle_item_starred(0, 0).unwrap();
+        app.view = View::Starred;
+        app.selected_item = Some(0);
+        app.selected_feed = None;
+        assert_eq!(
+            app.get_starred_dashboard_items().len(),
+            1,
+            "Starred view has one item to focus"
+        );
+
+        dispatch_action(&mut app, KeyAction::ToggleRead);
+
+        assert_eq!(
+            app.read_items.len(),
+            1,
+            "expected item to be marked read via dispatch_action"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
     }
 }
