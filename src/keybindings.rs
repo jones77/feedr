@@ -108,6 +108,47 @@ pub enum KeyAction {
     PrevTab,
 }
 
+impl KeyAction {
+    /// Return the dashed lowercase name a user would write in their config
+    /// (the inverse of `FromStr`, modulo `-` vs `_`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::ForceQuit => "force-quit",
+            Self::Back => "back",
+            Self::Home => "home",
+            Self::ToggleTheme => "toggle-theme",
+            Self::Refresh => "refresh",
+            Self::Help => "help",
+            Self::OpenSearch => "open-search",
+            Self::MoveUp => "move-up",
+            Self::MoveDown => "move-down",
+            Self::PageUp => "page-up",
+            Self::PageDown => "page-down",
+            Self::JumpTop => "jump-top",
+            Self::JumpBottom => "jump-bottom",
+            Self::Select => "select",
+            Self::AddFeed => "add-feed",
+            Self::DeleteFeed => "delete-feed",
+            Self::ToggleRead => "toggle-read",
+            Self::ToggleStar => "toggle-star",
+            Self::MarkAllRead => "mark-all-read",
+            Self::OpenInBrowser => "open-in-browser",
+            Self::TogglePreview => "toggle-preview",
+            Self::OpenFilter => "open-filter",
+            Self::CycleCategory => "cycle-category",
+            Self::OpenCategoryManagement => "open-category-management",
+            Self::AssignCategory => "assign-category",
+            Self::ExtractLinks => "extract-links",
+            Self::ScrollPreviewUp => "scroll-preview-up",
+            Self::ScrollPreviewDown => "scroll-preview-down",
+            Self::ToggleExpand => "toggle-expand",
+            Self::NextTab => "next-tab",
+            Self::PrevTab => "prev-tab",
+        }
+    }
+}
+
 impl FromStr for KeyAction {
     type Err = ();
 
@@ -524,13 +565,10 @@ fn split_description(s: &str) -> (&str, Option<String>) {
             i += 1;
             continue;
         }
-        if !in_quote
-            && b == b' '
-            && i + 3 < bytes.len()
-            && bytes[i + 1] == b'-'
-            && bytes[i + 2] == b'-'
-            && bytes[i + 3] == b' '
-        {
+        // Look for the literal byte sequence ` -- ` (space-dash-dash-space)
+        // outside quoted spans. `b == b' '` is the leading space; the rest of
+        // the separator is matched with a single slice compare.
+        if !in_quote && b == b' ' && bytes.get(i + 1..=i + 3) == Some(b"-- ") {
             // i and i+4 are ASCII boundaries; safe to slice.
             let body = &s[..i];
             let desc_part = s[i + 4..].trim();
@@ -1042,5 +1080,54 @@ mod tests {
 
         let (_, warnings) = resolve_macro_options("notakey++", "body");
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_keyaction_as_str_roundtrip_with_fromstr() {
+        // Every KeyAction must round-trip through as_str() -> "-"→"_" -> from_str().
+        // If you add a new KeyAction variant, add it to both maps.
+        let all = [
+            KeyAction::Quit,
+            KeyAction::ForceQuit,
+            KeyAction::Back,
+            KeyAction::Home,
+            KeyAction::ToggleTheme,
+            KeyAction::Refresh,
+            KeyAction::Help,
+            KeyAction::OpenSearch,
+            KeyAction::MoveUp,
+            KeyAction::MoveDown,
+            KeyAction::PageUp,
+            KeyAction::PageDown,
+            KeyAction::JumpTop,
+            KeyAction::JumpBottom,
+            KeyAction::Select,
+            KeyAction::AddFeed,
+            KeyAction::DeleteFeed,
+            KeyAction::ToggleRead,
+            KeyAction::ToggleStar,
+            KeyAction::MarkAllRead,
+            KeyAction::OpenInBrowser,
+            KeyAction::TogglePreview,
+            KeyAction::OpenFilter,
+            KeyAction::CycleCategory,
+            KeyAction::OpenCategoryManagement,
+            KeyAction::AssignCategory,
+            KeyAction::ExtractLinks,
+            KeyAction::ScrollPreviewUp,
+            KeyAction::ScrollPreviewDown,
+            KeyAction::ToggleExpand,
+            KeyAction::NextTab,
+            KeyAction::PrevTab,
+        ];
+        for a in all {
+            let s = a.as_str();
+            // Display form uses dashes for readability.
+            assert!(!s.contains('_'), "as_str() should use dashes, got: {}", s);
+            let parsed = KeyAction::from_str(&s.replace('-', "_")).unwrap_or_else(|_| {
+                panic!("could not round-trip KeyAction::{:?} via as_str()={}", a, s)
+            });
+            assert_eq!(parsed, a);
+        }
     }
 }

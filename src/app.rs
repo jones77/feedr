@@ -4,7 +4,7 @@ use crate::ui::ColorScheme;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -124,6 +124,10 @@ pub struct App {
     pub macro_options: crate::keybindings::MacroOptions,
     /// True after the macro-prefix key has been pressed and we are awaiting the next key.
     pub awaiting_macro_key: bool,
+    /// When `awaiting_macro_key` was last set, so the TUI tick loop can time it
+    /// out after `macro_prefix_timeout` rather than stranding the prefix state
+    /// across an idle period.
+    pub awaiting_macro_key_since: Option<Instant>,
     /// Item IDs that exec_on_new has already fired for (persisted).
     pub seen_items: HashSet<String>,
     /// Feed URLs whose first successful fetch has been observed (persisted).
@@ -134,7 +138,11 @@ pub struct App {
     /// state) and PipeTo/Exec (which spawn children). Draining happens at
     /// the loop level because PipeTo needs the terminal handle to suspend
     /// the TUI, which `handle_events` does not have access to.
-    pub pending_macro_steps: Vec<crate::keybindings::MacroStep>,
+    pub pending_macro_steps: VecDeque<crate::keybindings::MacroStep>,
+    /// Pre-tokenized `[hooks].exec_on_new` template. `None` if the hook is
+    /// disabled or the template failed to tokenize at startup (in which case
+    /// a startup warning is surfaced).
+    pub exec_on_new_template: Option<Vec<String>>,
 }
 
 /// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
@@ -265,6 +273,24 @@ impl App {
         let (macros, mac_warnings) =
             crate::keybindings::build_macros(&config.macros, &macro_options);
 
+        // Pre-tokenize the exec_on_new template once at startup so we don't
+        // re-shlex on every feed arrival, and surface tokenization errors as a
+        // startup warning instead of an unexpected runtime failure later.
+        let mut hook_warnings: Vec<String> = Vec::new();
+        let exec_on_new_template = config
+            .hooks
+            .exec_on_new
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|t| match shlex::split(t) {
+                Some(toks) if !toks.is_empty() => Some(toks),
+                _ => {
+                    hook_warnings.push(format!("exec_on_new: could not tokenize: {}", t));
+                    None
+                }
+            });
+
         let mut app = Self {
             config,
             feeds: Vec::new(),
@@ -320,9 +346,11 @@ impl App {
             macros,
             macro_options,
             awaiting_macro_key: false,
+            awaiting_macro_key_since: None,
             seen_items: saved_data.seen_items,
             feeds_seeded: saved_data.feeds_seeded,
-            pending_macro_steps: Vec::new(),
+            pending_macro_steps: VecDeque::new(),
+            exec_on_new_template,
         };
 
         app.update_dashboard();
@@ -331,6 +359,7 @@ impl App {
         let mut all_warnings = kb_warnings;
         all_warnings.extend(mo_warnings);
         all_warnings.extend(mac_warnings);
+        all_warnings.extend(hook_warnings);
         if !all_warnings.is_empty() {
             app.error = Some(format!("Config: {}", all_warnings.join("; ")));
         }
@@ -1651,6 +1680,21 @@ impl App {
     }
 }
 
+/// Build an `ArticleContext` directly from a `Feed` + `FeedItem` pair —
+/// the path used by `exec_on_new`, where the new item may not yet live
+/// inside `App::feeds`.
+pub fn article_context_from<'a>(feed: &'a Feed, item: &'a FeedItem) -> ArticleContext<'a> {
+    ArticleContext {
+        title: &item.title,
+        url: item.link.as_deref(),
+        author: item.author.as_deref(),
+        formatted_date: item.formatted_date.as_deref(),
+        feed_title: &feed.title,
+        feed_url: &feed.url,
+        plain_text: item.plain_text.as_deref(),
+    }
+}
+
 /// Build the same identifier scheme used by `read_items`/`starred_items` from
 /// a feed + item that may not yet be in `App::feeds`.
 pub fn make_item_id(feed: &Feed, item: &FeedItem) -> String {
@@ -2408,5 +2452,52 @@ mod tests {
         item2.link = None;
         item2.title = "T2".to_string();
         assert_eq!(make_item_id(&feed, &item2), "https://ex.com/feed.xml_T2");
+    }
+
+    #[test]
+    fn test_saved_data_seen_items_feeds_seeded_roundtrip() {
+        // Verify that the new persistence fields survive a JSON round-trip
+        // with the same shape the App expects.
+        let mut seen_items = HashSet::new();
+        seen_items.insert("https://ex.com/a".to_string());
+        seen_items.insert("https://ex.com/feed.xml_T2".to_string());
+        let mut feeds_seeded = HashSet::new();
+        feeds_seeded.insert("https://ex.com/feed.xml".to_string());
+
+        let original = SavedData {
+            bookmarks: vec!["https://ex.com/feed.xml".to_string()],
+            categories: vec![],
+            read_items: HashSet::new(),
+            starred_items: HashSet::new(),
+            last_session_time: None,
+            seen_items: seen_items.clone(),
+            feeds_seeded: feeds_seeded.clone(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: SavedData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.seen_items, seen_items);
+        assert_eq!(parsed.feeds_seeded, feeds_seeded);
+    }
+
+    #[test]
+    fn test_saved_data_back_compat_without_new_fields() {
+        // An older feedr_data.json with no seen_items / feeds_seeded must
+        // still deserialize (defaults to empty sets), so users who upgrade
+        // mid-flight don't lose their bookmarks.
+        let json = r#"{
+            "bookmarks": ["https://ex.com/feed.xml"],
+            "categories": [],
+            "read_items": [],
+            "starred_items": []
+        }"#;
+        let parsed: SavedData = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.bookmarks,
+            vec!["https://ex.com/feed.xml".to_string()]
+        );
+        assert!(parsed.seen_items.is_empty());
+        assert!(parsed.feeds_seeded.is_empty());
     }
 }

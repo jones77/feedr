@@ -821,7 +821,7 @@ pub(super) fn render_help_overlay<B: Backend>(f: &mut Frame<B>, app: &App, color
                     .steps
                     .iter()
                     .map(|s| match s {
-                        MacroStep::Action(a) => format!("{:?}", a),
+                        MacroStep::Action(a) => a.as_str().to_string(),
                         MacroStep::PipeTo { argv_template, .. } => {
                             format!("pipe-to {}", argv_template.join(" "))
                         }

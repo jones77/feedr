@@ -409,20 +409,39 @@ impl Config {
              # ── External-command hooks ──────────────────────────────\n\
              #\n\
              # Macros bind a key (invoked as <prefix><key>, default prefix is ',') to\n\
-             # an ordered chain of actions. Steps are separated by ';'. Recognized\n\
-             # action names mirror the existing keybinding actions (use dashes), plus\n\
-             # the synthetic ops `pipe-to` and `exec`. Variables expanded per token:\n\
-             #   %t title  %u url  %a author  %d date  %f feed-title  %F feed-url\n\
+             # an ordered chain of steps. Steps are separated by ';'. A trailing\n\
+             # ` -- \"description\"` overrides the help-overlay label.\n\
              #\n\
-             # IMPORTANT: command templates are NOT run through a shell. They are\n\
-             # tokenized once via shell-style splitting and %X is substituted into\n\
-             # individual argv tokens. If you need pipes or redirection, write a\n\
-             # shell script and invoke that.\n\
+             # Step kinds:\n\
+             #   <action>                     run a built-in action (see list below)\n\
+             #   pipe-to \"cmd %u\" [stdin=…]   run `cmd %u` with article content on stdin\n\
+             #   exec    \"cmd %u\"             run `cmd %u` with no stdin\n\
+             #\n\
+             # Supported actions inside macros:\n\
+             #   open-in-browser, toggle-star, toggle-read, mark-all-read,\n\
+             #   refresh, toggle-theme, extract-links, help\n\
+             # Other keybinding actions are intentionally not callable from macros.\n\
+             #\n\
+             # Variables expanded per argv token:\n\
+             #   %t title  %u url  %a author  %d date  %f feed-title  %F feed-url  %% literal %\n\
+             #\n\
+             # IMPORTANT — commands are NOT run through a shell:\n\
+             #   * Templates are tokenized once and %X is substituted into argv tokens.\n\
+             #     Article content cannot break out of an argument.\n\
+             #   * For pipes, redirection, or globbing, write a small shell script\n\
+             #     and invoke that.\n\
+             #   * `~` and `$HOME` / `$VAR` are NOT expanded — use absolute paths.\n\
+             #   * Wrapping your command in `sh -c \"... %t ...\"` REINTRODUCES shell\n\
+             #     injection through item titles. Prefer a script file.\n\
+             #\n\
+             # Quoting: the outer parser is shell-style, so to put a quoted token in\n\
+             # the inner argv, escape twice:\n\
+             #   pipe-to \"echo \\\"hello world\\\"\"\n\
              #\n\
              # [macros]\n\
              # y = 'open-in-browser ; pipe-to \"yt-dlp %u\"'\n\
              # w = 'pipe-to \"wallabag-cli add %u\" -- \"Save to Wallabag\"'\n\
-             # n = 'pipe-to \"tee out.txt\" stdin=metadata'\n\
+             # n = 'pipe-to \"tee /tmp/out.txt\" stdin=metadata'\n\
              #\n\
              # [macro_options]\n\
              # prefix = \",\"                  # the macro-prefix key\n\
@@ -431,6 +450,9 @@ impl Config {
              # The exec_on_new hook fires once per newly-seen item on each refresh.\n\
              # The first successful fetch of a feed seeds the seen set silently to\n\
              # avoid a firehose on initial load. Children are spawned detached.\n\
+             # Semantics on crash are AT MOST ONCE — feedr persists the seen-set\n\
+             # before spawning, so a kill mid-fire loses a notification rather than\n\
+             # firing again on the next launch. Prefer idempotent commands.\n\
              #\n\
              # [hooks]\n\
              # exec_on_new = 'notify-send \"New: %t\" \"%f\"'\n",

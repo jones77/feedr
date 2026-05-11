@@ -104,7 +104,7 @@ fn handle_toggle_read_current(app: &mut App) {
 /// Queue every step of a macro for the TUI drain in order.
 fn run_macro(app: &mut App, mac: &MacroBinding) {
     for step in &mac.steps {
-        app.pending_macro_steps.push(step.clone());
+        app.pending_macro_steps.push_back(step.clone());
     }
 }
 
@@ -161,8 +161,8 @@ pub(crate) fn dispatch_action(app: &mut App, action: KeyAction) {
         KeyAction::ExtractLinks => app.extract_links_from_current_item(),
         other => {
             app.error = Some(format!(
-                "macro: action '{:?}' not supported in macros",
-                other
+                "macro: action '{}' not supported in macros",
+                other.as_str()
             ));
         }
     }
@@ -250,6 +250,14 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
     if app.input_mode == InputMode::Normal {
         if app.awaiting_macro_key {
             app.awaiting_macro_key = false;
+            app.awaiting_macro_key_since = None;
+            // Clear the "Macro prefix..." hint so it doesn't outlive the wait.
+            app.success_message = None;
+            app.success_message_time = None;
+            // ESC explicitly cancels; the key is consumed and nothing else fires.
+            if key.code == KeyCode::Esc {
+                return Ok(false);
+            }
             match app.macro_for_key(&key) {
                 Some(mac) => {
                     let mac = mac.clone();
@@ -262,9 +270,11 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
             return Ok(false);
         }
         if app.macro_options.prefix.matches(&key) && !app.macros.is_empty() {
+            let now = std::time::Instant::now();
             app.awaiting_macro_key = true;
+            app.awaiting_macro_key_since = Some(now);
             app.success_message = Some("Macro prefix... press macro key".to_string());
-            app.success_message_time = Some(std::time::Instant::now());
+            app.success_message_time = Some(now);
             return Ok(false);
         }
     }
@@ -1919,5 +1929,89 @@ mod tests {
         let result = handle_key_event(&mut app, q).unwrap();
         assert!(!result);
         assert_eq!(app.view, View::FeedList);
+    }
+
+    // ── Macro engine tests ────────────────────────────────────────
+
+    #[test]
+    fn test_dispatch_action_rejects_unsupported_action() {
+        let mut app = make_test_app();
+        // MoveUp is intentionally not callable from macros — verify the error
+        // surfaces the friendly dashed name, not a debug-formatted variant.
+        dispatch_action(&mut app, KeyAction::MoveUp);
+        let err = app.error.as_deref().unwrap_or("");
+        assert!(err.contains("move-up"), "got error: {}", err);
+        assert!(err.contains("not supported"), "got error: {}", err);
+    }
+
+    #[test]
+    fn test_macro_prefix_esc_cancels_cleanly() {
+        let mut app = make_test_app();
+        // Bind a macro so the prefix is active.
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![crate::keybindings::MacroStep::Action(KeyAction::Refresh)],
+            description: None,
+        }];
+
+        // Press the prefix.
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        assert!(app.awaiting_macro_key);
+
+        // ESC must cancel without firing anything and without surfacing an error.
+        let esc = make_key(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert!(app.awaiting_macro_key_since.is_none());
+        assert!(
+            app.error.is_none(),
+            "ESC must not produce an error, got: {:?}",
+            app.error
+        );
+        assert!(app.pending_macro_steps.is_empty());
+    }
+
+    #[test]
+    fn test_macro_prefix_unknown_followup_errors_but_clears_state() {
+        let mut app = make_test_app();
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![crate::keybindings::MacroStep::Action(KeyAction::Refresh)],
+            description: None,
+        }];
+
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        // Press an unbound follow-up key. We surface an error rather than
+        // silently falling through to normal dispatch, but the prefix state
+        // must be cleared so subsequent keystrokes work normally.
+        let z = make_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        handle_key_event(&mut app, z).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert!(app.awaiting_macro_key_since.is_none());
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn test_macro_prefix_then_bound_key_queues_steps() {
+        let mut app = make_test_app();
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![
+                crate::keybindings::MacroStep::Action(KeyAction::ToggleStar),
+                crate::keybindings::MacroStep::Exec {
+                    argv_template: vec!["true".to_string()],
+                },
+            ],
+            description: None,
+        }];
+
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        let y = make_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        handle_key_event(&mut app, y).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert_eq!(app.pending_macro_steps.len(), 2);
     }
 }

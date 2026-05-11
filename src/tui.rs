@@ -141,8 +141,7 @@ pub fn run(mut app: App) -> Result<()> {
 /// to avoid running a follow-up step in an undefined state.
 fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
     use crate::keybindings::MacroStep;
-    while !app.pending_macro_steps.is_empty() {
-        let step = app.pending_macro_steps.remove(0);
+    while let Some(step) = app.pending_macro_steps.pop_front() {
         match step {
             MacroStep::Action(a) => crate::events::dispatch_action(app, a),
             MacroStep::PipeTo {
@@ -185,44 +184,37 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
 /// `[hooks].exec_on_new` template (if configured) for each genuinely-new item.
 /// On the first successful fetch of a feed (URL not yet in `feeds_seeded`),
 /// seed the seen set silently to suppress the firehose.
+///
+/// Persistence order is "mark-seen, persist, spawn" so semantics on crash are
+/// AT MOST ONCE: a kill between persist and spawn loses a notification, but a
+/// later restart never re-fires the same item. This matters for side-effecting
+/// hooks like `wallabag-cli add`.
 fn fire_exec_on_new(app: &mut App, feed: &Feed) {
     let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
     if newly_seen_idx.is_empty() {
         return;
     }
-    let template_str = match app.config.hooks.exec_on_new.as_deref() {
-        Some(t) if !t.trim().is_empty() => t.to_string(),
-        _ => return,
+    // Persist the updated seen set before spawning. If we crash before
+    // spawning, the user misses a notification — preferable to a duplicate
+    // for side-effecting hooks.
+    let _ = app.save_data();
+
+    let argv_template = match app.exec_on_new_template.as_ref() {
+        Some(t) => t.clone(),
+        None => return,
     };
-    let argv_template = match shlex::split(&template_str) {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            app.error = Some(format!(
-                "exec_on_new: could not tokenize template: {}",
-                template_str
-            ));
-            return;
-        }
-    };
+    let mut first_failure_recorded = false;
     for idx in newly_seen_idx {
         let item = match feed.items.get(idx) {
             Some(i) => i,
             None => continue,
         };
-        let ctx = crate::app::ArticleContext {
-            title: &item.title,
-            url: item.link.as_deref(),
-            author: item.author.as_deref(),
-            formatted_date: item.formatted_date.as_deref(),
-            feed_title: &feed.title,
-            feed_url: &feed.url,
-            plain_text: item.plain_text.as_deref(),
-        };
+        let ctx = crate::app::article_context_from(feed, item);
         let argv = crate::app::expand_argv_template(&argv_template, &ctx);
         if let Err(e) = spawn_detached(&argv, None) {
-            // Show the first failure; subsequent ones are suppressed.
-            if app.error.is_none() {
+            if !first_failure_recorded {
                 app.error = Some(format!("exec_on_new: {}", e));
+                first_failure_recorded = true;
             }
         }
     }
@@ -369,6 +361,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                 if app.success_message.is_some() && msg_time.elapsed() >= success_timeout {
                     app.success_message = None;
                     app.success_message_time = None;
+                }
+            }
+
+            // Time out a stranded macro-prefix wait so the next unrelated
+            // keystroke isn't silently consumed as a macro follow-up.
+            if let Some(since) = app.awaiting_macro_key_since {
+                if since.elapsed() >= success_timeout {
+                    app.awaiting_macro_key = false;
+                    app.awaiting_macro_key_since = None;
                 }
             }
 
