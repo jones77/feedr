@@ -144,11 +144,19 @@ pub fn run(mut app: App) -> Result<()> {
 
 /// Drain all queued macro steps in FIFO order. Action steps mutate app
 /// state inline, PipeTo suspends the terminal for a blocking child, Exec
-/// spawns detached. On the first error the rest of the queue is dropped
-/// to avoid running a follow-up step in an undefined state.
+/// spawns detached. On the first failure of any step the rest of the queue
+/// is dropped — a "failure" is any condition that surfaces `app.error`
+/// (spawn failures, missing article context, or an Action that sets the
+/// error itself, e.g. `open-in-browser` with no URL). PipeTo non-zero exits
+/// are not treated as failures: a script that returns 1 to mean "skip" is a
+/// reasonable usage, and the user already saw the child's output.
 fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
     use crate::keybindings::MacroStep;
     while let Some(step) = app.pending_macro_steps.pop_front() {
+        // Track whether this step introduced a new error so a chain like
+        // `open-in-browser ; toggle-star` halts when `open-in-browser` fails,
+        // matching the contract documented above and the PipeTo / Exec paths.
+        let pre_error = app.error.is_some();
         match step {
             MacroStep::Action(a) => crate::events::dispatch_action(app, a),
             MacroStep::PipeTo {
@@ -181,8 +189,14 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
                 };
                 if let Err(e) = spawn_detached(&argv) {
                     app.error = Some(format!("exec: {}", e));
+                    app.pending_macro_steps.clear();
+                    break;
                 }
             }
+        }
+        if !pre_error && app.error.is_some() {
+            app.pending_macro_steps.clear();
+            break;
         }
     }
 }
@@ -390,5 +404,91 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
             last_tick = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keybindings::{KeyAction, MacroStep};
+    use ratatui::backend::TestBackend;
+
+    fn test_terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(80, 24)).unwrap()
+    }
+
+    #[test]
+    fn test_drain_halts_when_action_sets_error() {
+        // A chain where step 1 errors must not run step 2. MoveUp is not
+        // supported in macros (sets app.error to a "not supported" message);
+        // OpenInBrowser with no focused article sets a different error. With
+        // halt-on-error the first message survives, because step 2 never runs.
+        // Without the halt, step 2 would overwrite app.error and a follow-up
+        // side-effecting step would run silently.
+        let mut app = App::new();
+        app.error = None;
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::MoveUp));
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::OpenInBrowser));
+
+        let mut terminal = test_terminal();
+        drain_macro_steps(&mut terminal, &mut app);
+
+        let err = app.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("move-up") && err.contains("not supported"),
+            "first error must survive; got: {}",
+            err
+        );
+        assert!(
+            !err.contains("open-in-browser"),
+            "step 2 must not have run (would have overwritten the error); got: {}",
+            err
+        );
+        assert!(app.pending_macro_steps.is_empty());
+    }
+
+    #[test]
+    fn test_drain_continues_when_steps_succeed() {
+        // Sanity: a clean chain runs every step. Two `help` steps are no-ops
+        // that don't set app.error; both must execute and leave the queue empty.
+        let mut app = App::new();
+        app.error = None;
+        app.show_help_overlay = false;
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::Help));
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::Help));
+
+        let mut terminal = test_terminal();
+        drain_macro_steps(&mut terminal, &mut app);
+
+        assert!(app.pending_macro_steps.is_empty());
+        assert!(app.error.is_none());
+        assert!(app.show_help_overlay);
+    }
+
+    #[test]
+    fn test_drain_preserves_preexisting_error_and_still_runs_step() {
+        // Edge case: if `app.error` is already set before a step runs, the
+        // step itself didn't set it — we must not treat it as a step failure.
+        // (In practice this can't happen because handle_events clears app.error
+        // on the next keypress, but the drain function shouldn't depend on that
+        // invariant.)
+        let mut app = App::new();
+        app.error = Some("stale error".to_string());
+        app.show_help_overlay = false;
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::Help));
+        app.pending_macro_steps
+            .push_back(MacroStep::Action(KeyAction::Help));
+
+        let mut terminal = test_terminal();
+        drain_macro_steps(&mut terminal, &mut app);
+
+        // Both steps ran despite the preexisting error.
+        assert!(app.pending_macro_steps.is_empty());
+        assert!(app.show_help_overlay);
     }
 }
