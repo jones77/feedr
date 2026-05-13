@@ -201,40 +201,50 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
     }
 }
 
-/// Diff a freshly-arrived feed against `app.seen_items` and fire the
-/// `[hooks].exec_on_new` template (if configured) for each genuinely-new item.
-/// On the first successful fetch of a feed (URL not yet in `feeds_seeded`),
-/// seed the seen set silently to suppress the firehose.
+/// Diff a freshly-arrived feed against `app.seen_items`, mutate the seen
+/// state in memory, and return the argv list to spawn for each genuinely-new
+/// item. On the first successful fetch of a feed (URL not yet in
+/// `feeds_seeded`), seed the seen set silently and return an empty list.
 ///
-/// Persistence order is "mark-seen, persist, spawn" so semantics on crash are
-/// AT MOST ONCE: a kill between persist and spawn loses a notification, but a
-/// later restart never re-fires the same item. This matters for side-effecting
-/// hooks like `wallabag-cli add`.
+/// Returns Vec rather than spawning + saving inline so a refresh batch can
+/// `save_data` ONCE before spawning ANY child, instead of once per feed
+/// arrival (write amplification of N for N bookmarks). Crash semantics still
+/// AT-MOST-ONCE: see [`flush_exec_on_new`] for the persistence ordering.
 ///
 /// No-op when the hook is not configured. seen_items / feeds_seeded only
 /// exist to drive this hook, so users who never opt in pay neither the
-/// memory cost nor the per-feed save_data round-trip.
-fn fire_exec_on_new(app: &mut App, feed: &Feed) {
+/// memory cost nor any save_data round-trip.
+fn collect_exec_on_new(app: &mut App, feed: &Feed) -> Vec<Vec<String>> {
     let argv_template = match app.exec_on_new_template.as_ref() {
         Some(t) => t.clone(),
-        None => return,
+        None => return Vec::new(),
     };
     let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
     if newly_seen_idx.is_empty() {
+        return Vec::new();
+    }
+    newly_seen_idx
+        .into_iter()
+        .filter_map(|idx| {
+            let item = feed.items.get(idx)?;
+            let ctx = crate::app::article_context_from(feed, item);
+            Some(crate::app::expand_argv_template(&argv_template, &ctx))
+        })
+        .collect()
+}
+
+/// Persist the updated seen-set, then spawn all collected exec_on_new
+/// children. The "save then spawn" order is the AT-MOST-ONCE guarantee:
+/// a kill between save and spawn loses notifications, but a restart never
+/// re-fires the same item. Matters for side-effecting hooks like
+/// `wallabag-cli add` where a duplicate is actively wrong.
+fn flush_exec_on_new(app: &mut App, pending: Vec<Vec<String>>) {
+    if pending.is_empty() {
         return;
     }
-    // Persist the updated seen set before spawning. If we crash before
-    // spawning, the user misses a notification — preferable to a duplicate
-    // for side-effecting hooks.
     let _ = app.save_data();
     let mut first_failure_recorded = false;
-    for idx in newly_seen_idx {
-        let item = match feed.items.get(idx) {
-            Some(i) => i,
-            None => continue,
-        };
-        let ctx = crate::app::article_context_from(feed, item);
-        let argv = crate::app::expand_argv_template(&argv_template, &ctx);
+    for argv in pending {
         if let Err(e) = spawn_detached(&argv) {
             if !first_failure_recorded {
                 app.error = Some(format!("exec_on_new: {}", e));
@@ -306,9 +316,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
         // Drain any feeds that arrived from background threads
         if pending_count > 0 {
+            // Accumulate exec_on_new spawns across every feed arriving in this
+            // tick, so we only `save_data` once before spawning. Saving per
+            // feed (the previous shape) was N whole-file JSON writes per
+            // refresh.
+            let mut pending_exec: Vec<Vec<String>> = Vec::new();
             while let Ok((idx, result)) = feed_rx.try_recv() {
                 if let Ok(feed) = result {
-                    fire_exec_on_new(app, &feed);
+                    pending_exec.extend(collect_exec_on_new(app, &feed));
                     // Insert at the correct position to maintain bookmark order,
                     // or append if earlier feeds haven't arrived yet
                     let insert_pos = app
@@ -349,6 +364,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                     let _ = app.save_data();
                 }
             }
+            // Persist seen-set ONCE for the whole batch, then spawn. Done
+            // outside the per-feed loop so a refresh that brings back items
+            // for many feeds writes the JSON file once instead of N times.
+            flush_exec_on_new(app, pending_exec);
         }
 
         // If loading, use a shorter timeout for animation

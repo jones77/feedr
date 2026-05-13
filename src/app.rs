@@ -903,6 +903,16 @@ impl App {
             if idx < self.feeds.len() {
                 let url = self.feeds[idx].url.clone();
 
+                // Drop this feed's exec_on_new tracking state before removing
+                // the feed itself — otherwise the URL would stay in
+                // feeds_seeded and its item IDs would stay in seen_items
+                // forever, growing the persisted JSON file monotonically.
+                self.feeds_seeded.remove(&url);
+                for item in &self.feeds[idx].items {
+                    let id = make_item_id(&self.feeds[idx], item);
+                    self.seen_items.remove(&id);
+                }
+
                 // Remove from feeds
                 self.feeds.remove(idx);
 
@@ -1726,7 +1736,12 @@ pub fn mark_feed_seen(app: &mut App, feed: &Feed) -> Vec<usize> {
             newly_seen.push(idx);
         }
     }
-    if is_first_fetch {
+    // Only flip the seeded bit on a fetch that actually returned items. A
+    // transiently-empty first fetch (server hiccup, parser edge case) would
+    // otherwise mark the feed as seeded with no items recorded; the next
+    // non-empty fetch would then treat every item as new and firehose
+    // exec_on_new for the entire backlog.
+    if is_first_fetch && !feed.items.is_empty() {
         app.feeds_seeded.insert(feed.url.clone());
     }
     newly_seen
@@ -2432,6 +2447,71 @@ mod tests {
         assert!(mark_feed_seen(&mut app, &feed_b).is_empty());
         assert!(app.feeds_seeded.contains("https://ex.com/a.xml"));
         assert!(app.feeds_seeded.contains("https://ex.com/b.xml"));
+    }
+
+    #[test]
+    fn test_mark_feed_seen_empty_first_fetch_does_not_seed() {
+        // Regression: a transiently-empty first fetch must not flip
+        // feeds_seeded. If it did, the next non-empty fetch would be treated
+        // as "subsequent" and fire exec_on_new for every backlog item — the
+        // exact firehose the first-fetch suppression exists to prevent.
+        let mut app = App::new();
+        let empty = synthetic_feed("https://ex.com/feed.xml", &[]);
+
+        let newly = mark_feed_seen(&mut app, &empty);
+        assert!(newly.is_empty());
+        assert!(
+            !app.feeds_seeded.contains("https://ex.com/feed.xml"),
+            "empty fetch must NOT mark feed as seeded"
+        );
+
+        // The next fetch — now with items — is still the first real fetch
+        // and must seed silently.
+        let with_items = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+        let newly = mark_feed_seen(&mut app, &with_items);
+        assert!(
+            newly.is_empty(),
+            "first non-empty fetch must seed silently, not fire"
+        );
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+        assert_eq!(app.seen_items.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_current_feed_cleans_up_tracking_state() {
+        // Regression: feed removal used to leave the URL in feeds_seeded and
+        // every item ID in seen_items forever, growing the persisted JSON
+        // file monotonically across feed churn.
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        let item_ids: Vec<String> = feed.items.iter().map(|i| make_item_id(&feed, i)).collect();
+
+        // Seed the tracking state as if exec_on_new had run for this feed.
+        mark_feed_seen(&mut app, &feed);
+        let second = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+        mark_feed_seen(&mut app, &second);
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+        for id in &item_ids {
+            assert!(app.seen_items.contains(id), "precondition: {} seen", id);
+        }
+
+        // Install the feed and trigger removal via the public path.
+        app.bookmarks.push("https://ex.com/feed.xml".to_string());
+        app.feeds.push(second);
+        app.selected_feed = Some(0);
+        app.remove_current_feed().unwrap();
+
+        assert!(
+            !app.feeds_seeded.contains("https://ex.com/feed.xml"),
+            "URL must be dropped from feeds_seeded"
+        );
+        for id in &item_ids {
+            assert!(
+                !app.seen_items.contains(id),
+                "item id {} must be dropped from seen_items",
+                id
+            );
+        }
     }
 
     #[test]

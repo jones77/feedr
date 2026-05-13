@@ -88,6 +88,11 @@ fn handle_toggle_read_current(app: &mut App) {
             app.error = Some(format!("Failed to toggle read status: {}", e));
         }
     }
+    // Re-filter so a `read_status = Some(false)` ("unread only") filter on the
+    // Dashboard drops the just-read item from the visible list. The Dashboard
+    // keypress used to do this inline; centralizing it here means macros and
+    // every other caller stay in sync.
+    app.apply_filters();
 }
 
 // ── Macro engine ───────────────────────────────────────────────────
@@ -2064,6 +2069,43 @@ mod tests {
             app.read_items.len(),
             1,
             "expected item to be marked read via dispatch_action"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_read_reapplies_filters_on_dashboard() {
+        // Regression: a `,r = toggle-read` macro on the Dashboard with the
+        // "unread only" filter active must remove the just-read item from the
+        // visible list. Previously dispatch_action -> handle_toggle_read_current
+        // skipped apply_filters(), so the dashboard kept showing stale state
+        // until the next filter change.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        app.view = View::Dashboard;
+
+        // Activate "unread only" filter, then materialize the filtered list.
+        app.filter_options.read_status = Some(false);
+        app.apply_filters();
+        let before = app.active_dashboard_items().len();
+        assert!(
+            before > 0,
+            "precondition: dashboard has unread items to filter on"
+        );
+        app.selected_item = Some(0);
+
+        dispatch_action(&mut app, KeyAction::ToggleRead);
+
+        assert_eq!(
+            app.read_items.len(),
+            1,
+            "item should be marked read via dispatch_action"
+        );
+        assert_eq!(
+            app.active_dashboard_items().len(),
+            before - 1,
+            "the just-read item must drop out of the unread-only filter"
         );
         assert!(app.error.is_none(), "should not error: {:?}", app.error);
     }
