@@ -36,6 +36,7 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Compact Mode**: Automatic compact layout for small terminals (≤30 rows), with manual `always`/`never` override in config
 - **CLI Config Management**: Get, set, and list configuration from the command line (`feedr config`), or use the interactive TUI config editor (`feedr config --tui`)
 - **Configurable Keybindings**: Remap any key action via the `[keybindings]` section in `config.toml`
+- **External-Command Hooks**: Newsboat-style macros (`pipe-to`, `exec`) bound to keys, plus `exec_on_new` notifications fired per new item — all with shell-free argument templating
 - **Configurable**: Customize timeouts, themes, UI behavior, and default feeds via TOML config
 - **XDG Compliant**: Follows standard directory specifications for configuration and data storage
 
@@ -312,6 +313,66 @@ X-API-Key = "your_api_key"
 Cookie = "session=abc123"
 ```
 Headers are sent with every request for that feed, including refreshes.
+
+### External-Command Hooks
+
+Feedr supports newsboat-style external commands for two workflows: **macros** (key-triggered chains that act on the focused article) and **`exec_on_new`** (a notification hook fired per newly-seen item after each refresh).
+
+**Commands are not run through a shell.** Templates are tokenized once at config load, and `%X` placeholders are substituted into individual `argv` tokens — feed content can never break out of an argument. For pipes, redirection, or globbing, write a small shell script and invoke that.
+
+#### Template Variables
+
+Expanded in every `argv` token of macro and hook commands:
+
+| Variable | Expands to |
+|----------|------------|
+| `%t` | Article title |
+| `%u` | Article URL |
+| `%a` | Author |
+| `%d` | Formatted publish date |
+| `%f` | Feed title |
+| `%F` | Feed URL |
+| `%%` | Literal `%` |
+
+#### Macros
+
+A macro binds a key to an ordered chain of steps. Trigger with `<prefix><key>` (default prefix is `,`). Steps are separated by `;`. An optional trailing ` -- "description"` overrides the help-overlay label.
+
+```toml
+[macros]
+y = 'open-in-browser ; pipe-to "yt-dlp %u"'
+w = 'pipe-to "wallabag-cli add %u" -- "Save to Wallabag"'
+n = 'pipe-to "tee /tmp/out.txt" stdin=metadata'
+
+[macro_options]
+prefix = ","                  # the macro-prefix key
+pipe_default_stdin = "body"   # body | title | url | metadata | none
+```
+
+**Step kinds:**
+- `<action>` — invoke a built-in action. Supported in macros: `open-in-browser`, `toggle-star`, `toggle-read`, `mark-all-read`, `refresh`, `toggle-theme`, `extract-links`, `help`.
+- `pipe-to "cmd %u" [stdin=…]` — suspend the TUI, run the command, and pipe article content to its stdin. `stdin` is one of `body` (default), `title`, `url`, `metadata`, or `none`.
+- `exec "cmd %u"` — spawn the command detached (no stdin, no terminal takeover).
+
+Chains halt on the first step error. Press `Esc` after the prefix to cancel; an unbound follow-up surfaces a "No macro bound" error. Macros are also rendered in the help overlay (`?`).
+
+#### `exec_on_new` Notifications
+
+Fire a command once per newly-seen item after each refresh. The first successful fetch of each feed seeds the seen-set silently — you do **not** get a firehose on initial load or first run.
+
+```toml
+[hooks]
+exec_on_new = 'notify-send "New: %t" "%f"'
+```
+
+Children are spawned **detached** so the TUI never blocks on them. Crash semantics are **at-most-once**: feedr persists the seen-set before spawning, so a kill mid-fire loses a notification rather than re-firing on the next launch. Prefer idempotent commands (e.g. `wallabag-cli add` is safe; `mail-me` is not).
+
+#### Security Notes
+
+- The shell is never invoked, so feed content in `%t` / `%a` / etc. cannot escape an argument.
+- **Do not wrap your command in `sh -c "... %t ..."`** — that reintroduces shell injection through item titles. Write a script file and invoke it instead.
+- `~` / `$HOME` / `$VAR` are **not** expanded — use absolute paths.
+- If a macro's command template has unbalanced quotes or names an unknown action, feedr surfaces a startup warning rather than failing silently at trigger time.
 
 ### Configurable Keybindings
 
