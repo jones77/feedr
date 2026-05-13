@@ -2,6 +2,69 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// What gets piped to stdin when a `pipe-to` macro step runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StdinKind {
+    None,
+    #[default]
+    Body,
+    Title,
+    Url,
+    Metadata,
+}
+
+impl FromStr for StdinKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "body" => Ok(Self::Body),
+            "title" => Ok(Self::Title),
+            "url" => Ok(Self::Url),
+            "metadata" => Ok(Self::Metadata),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A single step inside a macro chain.
+#[derive(Clone, Debug)]
+pub enum MacroStep {
+    /// Invoke an existing keybinding action (e.g. open-in-browser, toggle-star).
+    Action(KeyAction),
+    /// Run argv with article content piped to stdin.
+    PipeTo {
+        argv_template: Vec<String>,
+        stdin: StdinKind,
+    },
+    /// Run argv with no stdin.
+    Exec { argv_template: Vec<String> },
+}
+
+/// A macro: a key trigger + an ordered sequence of steps + optional description.
+#[derive(Clone, Debug)]
+pub struct MacroBinding {
+    pub trigger: KeyBinding,
+    pub steps: Vec<MacroStep>,
+    pub description: Option<String>,
+}
+
+/// Top-level options for the macro engine.
+#[derive(Clone, Debug)]
+pub struct MacroOptions {
+    pub prefix: KeyBinding,
+    pub pipe_default_stdin: StdinKind,
+}
+
+impl Default for MacroOptions {
+    fn default() -> Self {
+        Self {
+            prefix: KeyBinding::new(KeyCode::Char(',')),
+            pipe_default_stdin: StdinKind::Body,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum KeyAction {
     // Global
@@ -43,6 +106,47 @@ pub enum KeyAction {
     // Tab
     NextTab,
     PrevTab,
+}
+
+impl KeyAction {
+    /// Return the dashed lowercase name a user would write in their config
+    /// (the inverse of `FromStr`, modulo `-` vs `_`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::ForceQuit => "force-quit",
+            Self::Back => "back",
+            Self::Home => "home",
+            Self::ToggleTheme => "toggle-theme",
+            Self::Refresh => "refresh",
+            Self::Help => "help",
+            Self::OpenSearch => "open-search",
+            Self::MoveUp => "move-up",
+            Self::MoveDown => "move-down",
+            Self::PageUp => "page-up",
+            Self::PageDown => "page-down",
+            Self::JumpTop => "jump-top",
+            Self::JumpBottom => "jump-bottom",
+            Self::Select => "select",
+            Self::AddFeed => "add-feed",
+            Self::DeleteFeed => "delete-feed",
+            Self::ToggleRead => "toggle-read",
+            Self::ToggleStar => "toggle-star",
+            Self::MarkAllRead => "mark-all-read",
+            Self::OpenInBrowser => "open-in-browser",
+            Self::TogglePreview => "toggle-preview",
+            Self::OpenFilter => "open-filter",
+            Self::CycleCategory => "cycle-category",
+            Self::OpenCategoryManagement => "open-category-management",
+            Self::AssignCategory => "assign-category",
+            Self::ExtractLinks => "extract-links",
+            Self::ScrollPreviewUp => "scroll-preview-up",
+            Self::ScrollPreviewDown => "scroll-preview-down",
+            Self::ToggleExpand => "toggle-expand",
+            Self::NextTab => "next-tab",
+            Self::PrevTab => "prev-tab",
+        }
+    }
 }
 
 impl FromStr for KeyAction {
@@ -387,43 +491,279 @@ pub fn build_keybindings(
     (map, warnings)
 }
 
-/// Get display string for the first binding of an action
-pub fn key_display(action: &KeyAction, map: &KeyBindingMap) -> String {
-    if let Some(bindings) = map.get(action) {
-        if let Some(binding) = bindings.first() {
-            let mut parts = Vec::new();
-            if binding.modifiers.contains(KeyModifiers::CONTROL) {
-                parts.push("Ctrl".to_string());
+// ── Macro parsing ─────────────────────────────────────────────────
+//
+// Newsboat-compatible string syntax:
+//   <op>; <op> [args]; ... [-- "<description>"]
+//
+// Examples:
+//   open-in-browser ; pipe-to "yt-dlp %u"
+//   pipe-to "wallabag-cli add %u" -- "Save to Wallabag"
+//   pipe-to "tee out.txt" stdin=metadata
+//
+// Recognized op names mirror existing KeyAction names but use dashes
+// (newsboat convention), e.g. `open-in-browser` <-> `open_in_browser`.
+// Two synthetic ops, `pipe-to` and `exec`, take a quoted command template
+// followed by optional `key=value` modifiers (currently only `stdin=`).
+
+/// Split a string on a single ASCII separator, ignoring occurrences inside
+/// double-quoted spans. Backslash escapes the next character.
+fn split_top_level(s: &str, sep: u8) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && b == sep {
+            out.push(s[start..i].to_string());
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Detect a trailing ` -- "description"` outside double-quoted spans.
+fn split_description(s: &str) -> (&str, Option<String>) {
+    let bytes = s.as_bytes();
+    let mut in_quote = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        // Look for the literal byte sequence ` -- ` (space-dash-dash-space)
+        // outside quoted spans. `b == b' '` is the leading space; the rest of
+        // the separator is matched with a single slice compare.
+        if !in_quote && b == b' ' && bytes.get(i + 1..=i + 3) == Some(b"-- ") {
+            // i and i+4 are ASCII boundaries; safe to slice.
+            let body = &s[..i];
+            let desc_part = s[i + 4..].trim();
+            let unquoted = desc_part
+                .strip_prefix('"')
+                .and_then(|d| d.strip_suffix('"'))
+                .unwrap_or(desc_part);
+            let desc = unquoted.to_string();
+            return (body, if desc.is_empty() { None } else { Some(desc) });
+        }
+        i += 1;
+    }
+    (s, None)
+}
+
+fn split_op_and_rest(step: &str) -> Option<(&str, &str)> {
+    let s = step.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(char::is_whitespace) {
+        Some(idx) => Some((&s[..idx], s[idx..].trim_start())),
+        None => Some((s, "")),
+    }
+}
+
+fn parse_pipe_or_exec_args(rest: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    // shlex::split returns None on unbalanced quotes
+    let tokens = shlex::split(rest).ok_or_else(|| format!("could not tokenize: {}", rest))?;
+    if tokens.is_empty() {
+        return Err("missing command argument".into());
+    }
+    let argv = shlex::split(&tokens[0])
+        .ok_or_else(|| format!("could not tokenize command: {}", tokens[0]))?;
+    if argv.is_empty() {
+        return Err("command is empty".into());
+    }
+    let modifiers = tokens[1..].to_vec();
+    Ok((argv, modifiers))
+}
+
+/// Parse one macro definition string into a sequence of steps and
+/// an optional human description.
+pub fn parse_macro_string(
+    raw: &str,
+    default_stdin: StdinKind,
+) -> Result<(Vec<MacroStep>, Option<String>), String> {
+    let (body, description) = split_description(raw);
+    let parts = split_top_level(body, b';');
+    let mut steps = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (op, rest) = split_op_and_rest(part).ok_or_else(|| "empty step".to_string())?;
+        match op {
+            "pipe-to" | "pipe_to" => {
+                let (argv_template, modifiers) =
+                    parse_pipe_or_exec_args(rest).map_err(|e| format!("pipe-to: {}", e))?;
+                let mut stdin = default_stdin;
+                for m in modifiers {
+                    let (k, v) = m
+                        .split_once('=')
+                        .ok_or_else(|| format!("pipe-to: unknown modifier '{}'", m))?;
+                    match k {
+                        "stdin" => {
+                            stdin = StdinKind::from_str(v)
+                                .map_err(|_| format!("pipe-to: invalid stdin kind '{}'", v))?;
+                        }
+                        _ => return Err(format!("pipe-to: unknown modifier '{}'", k)),
+                    }
+                }
+                steps.push(MacroStep::PipeTo {
+                    argv_template,
+                    stdin,
+                });
             }
-            if binding.modifiers.contains(KeyModifiers::SHIFT) {
-                parts.push("Shift".to_string());
+            "exec" => {
+                let (argv_template, modifiers) =
+                    parse_pipe_or_exec_args(rest).map_err(|e| format!("exec: {}", e))?;
+                if !modifiers.is_empty() {
+                    return Err(format!("exec takes no modifiers, got: {:?}", modifiers));
+                }
+                steps.push(MacroStep::Exec { argv_template });
             }
-            if binding.modifiers.contains(KeyModifiers::ALT) {
-                parts.push("Alt".to_string());
+            _ => {
+                let normalized = op.replace('-', "_");
+                let action = KeyAction::from_str(&normalized)
+                    .map_err(|_| format!("unknown action '{}'", op))?;
+                if !rest.is_empty() {
+                    return Err(format!("action '{}' takes no arguments, got: {}", op, rest));
+                }
+                steps.push(MacroStep::Action(action));
             }
-            let key_name = match binding.code {
-                KeyCode::Char(' ') => "Space".to_string(),
-                KeyCode::Char(c) => c.to_string(),
-                KeyCode::Enter => "Enter".to_string(),
-                KeyCode::Esc => "Esc".to_string(),
-                KeyCode::Tab => "Tab".to_string(),
-                KeyCode::Backspace => "Backspace".to_string(),
-                KeyCode::Up => "\u{2191}".to_string(),
-                KeyCode::Down => "\u{2193}".to_string(),
-                KeyCode::Left => "\u{2190}".to_string(),
-                KeyCode::Right => "\u{2192}".to_string(),
-                KeyCode::Home => "Home".to_string(),
-                KeyCode::End => "End".to_string(),
-                KeyCode::PageUp => "PgUp".to_string(),
-                KeyCode::PageDown => "PgDn".to_string(),
-                KeyCode::F(n) => format!("F{}", n),
-                _ => "?".to_string(),
-            };
-            parts.push(key_name);
-            return parts.join("+");
         }
     }
-    "?".to_string()
+    if steps.is_empty() {
+        return Err("macro has no steps".into());
+    }
+    Ok((steps, description))
+}
+
+/// Build the parsed macro list from a config map of `key -> definition string`.
+/// Returns the bindings and a list of warnings for invalid entries.
+pub fn build_macros(
+    config_macros: &HashMap<String, String>,
+    options: &MacroOptions,
+) -> (Vec<MacroBinding>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    let mut keys: Vec<&String> = config_macros.keys().collect();
+    keys.sort();
+    for key in keys {
+        let body = &config_macros[key];
+        let trigger = match parse_key_string(key) {
+            Some(b) => b,
+            None => {
+                warnings.push(format!("could not parse macro key '{}'", key));
+                continue;
+            }
+        };
+        match parse_macro_string(body, options.pipe_default_stdin) {
+            Ok((steps, description)) => out.push(MacroBinding {
+                trigger,
+                steps,
+                description,
+            }),
+            Err(e) => warnings.push(format!("macro '{}': {}", key, e)),
+        }
+    }
+    (out, warnings)
+}
+
+/// Resolve `MacroOptions` from raw string-typed config values.
+pub fn resolve_macro_options(
+    prefix_str: &str,
+    pipe_default_stdin_str: &str,
+) -> (MacroOptions, Vec<String>) {
+    let mut options = MacroOptions::default();
+    let mut warnings = Vec::new();
+    match parse_key_string(prefix_str) {
+        Some(b) => options.prefix = b,
+        None => warnings.push(format!("invalid macro prefix '{}'", prefix_str)),
+    }
+    match StdinKind::from_str(pipe_default_stdin_str) {
+        Ok(k) => options.pipe_default_stdin = k,
+        Err(_) => warnings.push(format!(
+            "invalid pipe_default_stdin '{}'",
+            pipe_default_stdin_str
+        )),
+    }
+    (options, warnings)
+}
+
+/// Format a single `KeyBinding` like `Ctrl+q`, `Shift+Tab`, `,`, `Space`.
+pub fn binding_display(binding: &KeyBinding) -> String {
+    let mut parts = Vec::new();
+    if binding.modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("Ctrl".to_string());
+    }
+    if binding.modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("Shift".to_string());
+    }
+    if binding.modifiers.contains(KeyModifiers::ALT) {
+        parts.push("Alt".to_string());
+    }
+    let key_name = match binding.code {
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Up => "\u{2191}".to_string(),
+        KeyCode::Down => "\u{2193}".to_string(),
+        KeyCode::Left => "\u{2190}".to_string(),
+        KeyCode::Right => "\u{2192}".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PgUp".to_string(),
+        KeyCode::PageDown => "PgDn".to_string(),
+        KeyCode::F(n) => format!("F{}", n),
+        _ => "?".to_string(),
+    };
+    parts.push(key_name);
+    parts.join("+")
+}
+
+/// Get display string for the first binding of an action
+pub fn key_display(action: &KeyAction, map: &KeyBindingMap) -> String {
+    map.get(action)
+        .and_then(|bindings| bindings.first())
+        .map(binding_display)
+        .unwrap_or_else(|| "?".to_string())
 }
 
 #[cfg(test)]
@@ -603,5 +943,191 @@ mod tests {
         assert!(parse_key_string("Ctrl+").is_none());
         // Multi-char key name that isn't a special key
         assert!(parse_key_string("abc").is_none());
+    }
+
+    // ── Macro parser ──────────────────────────────────────────────
+
+    #[test]
+    fn test_macro_single_action() {
+        let (steps, desc) = parse_macro_string("open-in-browser", StdinKind::Body).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(
+            steps[0],
+            MacroStep::Action(KeyAction::OpenInBrowser)
+        ));
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn test_macro_chain_with_pipe() {
+        let (steps, desc) =
+            parse_macro_string(r#"open-in-browser ; pipe-to "yt-dlp %u""#, StdinKind::Body)
+                .unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(
+            steps[0],
+            MacroStep::Action(KeyAction::OpenInBrowser)
+        ));
+        match &steps[1] {
+            MacroStep::PipeTo {
+                argv_template,
+                stdin,
+            } => {
+                assert_eq!(argv_template, &vec!["yt-dlp".to_string(), "%u".to_string()]);
+                assert_eq!(*stdin, StdinKind::Body);
+            }
+            other => panic!("expected PipeTo, got {:?}", other),
+        }
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn test_macro_with_description() {
+        let (steps, desc) =
+            parse_macro_string(r#"toggle-star -- "Star current item""#, StdinKind::Body).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(desc, Some("Star current item".to_string()));
+    }
+
+    #[test]
+    fn test_macro_pipe_with_stdin_modifier() {
+        let (steps, _) =
+            parse_macro_string(r#"pipe-to "tee out.txt" stdin=url"#, StdinKind::Body).unwrap();
+        match &steps[0] {
+            MacroStep::PipeTo {
+                argv_template,
+                stdin,
+            } => {
+                assert_eq!(
+                    argv_template,
+                    &vec!["tee".to_string(), "out.txt".to_string()]
+                );
+                assert_eq!(*stdin, StdinKind::Url);
+            }
+            other => panic!("expected PipeTo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_macro_exec_no_stdin() {
+        let (steps, _) =
+            parse_macro_string(r#"exec "notify-send hello""#, StdinKind::Body).unwrap();
+        match &steps[0] {
+            MacroStep::Exec { argv_template } => {
+                assert_eq!(
+                    argv_template,
+                    &vec!["notify-send".to_string(), "hello".to_string()]
+                );
+            }
+            other => panic!("expected Exec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_macro_unknown_action_errors() {
+        assert!(parse_macro_string("frobnicate", StdinKind::Body).is_err());
+    }
+
+    #[test]
+    fn test_macro_unbalanced_quote_errors() {
+        assert!(parse_macro_string(r#"pipe-to "tee out.txt"#, StdinKind::Body).is_err());
+    }
+
+    #[test]
+    fn test_macro_empty_errors() {
+        assert!(parse_macro_string("", StdinKind::Body).is_err());
+        assert!(parse_macro_string(" ; ; ", StdinKind::Body).is_err());
+    }
+
+    #[test]
+    fn test_macro_semicolon_inside_quotes_not_split() {
+        let (steps, _) = parse_macro_string(r#"pipe-to "echo a;b""#, StdinKind::Body).unwrap();
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            MacroStep::PipeTo { argv_template, .. } => {
+                // shlex splits "echo a;b" into ["echo", "a;b"]
+                assert_eq!(argv_template, &vec!["echo".to_string(), "a;b".to_string()]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_build_macros_warns_on_bad_key() {
+        let mut macros = HashMap::new();
+        macros.insert("notakey++".to_string(), "open-in-browser".to_string());
+        let (out, warnings) = build_macros(&macros, &MacroOptions::default());
+        assert!(out.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("could not parse macro key"));
+    }
+
+    #[test]
+    fn test_build_macros_warns_on_bad_body() {
+        let mut macros = HashMap::new();
+        macros.insert("y".to_string(), "frobnicate".to_string());
+        let (out, warnings) = build_macros(&macros, &MacroOptions::default());
+        assert!(out.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown action"));
+    }
+
+    #[test]
+    fn test_resolve_macro_options() {
+        let (opts, warnings) = resolve_macro_options(",", "metadata");
+        assert!(warnings.is_empty());
+        assert_eq!(opts.pipe_default_stdin, StdinKind::Metadata);
+
+        let (_, warnings) = resolve_macro_options("notakey++", "body");
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_keyaction_as_str_roundtrip_with_fromstr() {
+        // Every KeyAction must round-trip through as_str() -> "-"→"_" -> from_str().
+        // If you add a new KeyAction variant, add it to both maps.
+        let all = [
+            KeyAction::Quit,
+            KeyAction::ForceQuit,
+            KeyAction::Back,
+            KeyAction::Home,
+            KeyAction::ToggleTheme,
+            KeyAction::Refresh,
+            KeyAction::Help,
+            KeyAction::OpenSearch,
+            KeyAction::MoveUp,
+            KeyAction::MoveDown,
+            KeyAction::PageUp,
+            KeyAction::PageDown,
+            KeyAction::JumpTop,
+            KeyAction::JumpBottom,
+            KeyAction::Select,
+            KeyAction::AddFeed,
+            KeyAction::DeleteFeed,
+            KeyAction::ToggleRead,
+            KeyAction::ToggleStar,
+            KeyAction::MarkAllRead,
+            KeyAction::OpenInBrowser,
+            KeyAction::TogglePreview,
+            KeyAction::OpenFilter,
+            KeyAction::CycleCategory,
+            KeyAction::OpenCategoryManagement,
+            KeyAction::AssignCategory,
+            KeyAction::ExtractLinks,
+            KeyAction::ScrollPreviewUp,
+            KeyAction::ScrollPreviewDown,
+            KeyAction::ToggleExpand,
+            KeyAction::NextTab,
+            KeyAction::PrevTab,
+        ];
+        for a in all {
+            let s = a.as_str();
+            // Display form uses dashes for readability.
+            assert!(!s.contains('_'), "as_str() should use dashes, got: {}", s);
+            let parsed = KeyAction::from_str(&s.replace('-', "_")).unwrap_or_else(|_| {
+                panic!("could not round-trip KeyAction::{:?} via as_str()={}", a, s)
+            });
+            assert_eq!(parsed, a);
+        }
     }
 }

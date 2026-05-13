@@ -18,6 +18,46 @@ pub struct Config {
     pub default_feeds: Vec<DefaultFeed>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub keybindings: HashMap<String, toml::Value>,
+    #[serde(default)]
+    pub hooks: HooksConfig,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub macros: HashMap<String, String>,
+    #[serde(default)]
+    pub macro_options: MacroOptionsConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// Shell-tokenized command template fired once per newly-seen item after a refresh.
+    /// Variables: %t title, %u url, %a author, %d formatted-date, %f feed-title, %F feed-url.
+    /// First-ever fetch of a feed is seeded silently (no firehose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_on_new: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MacroOptionsConfig {
+    #[serde(default = "default_macro_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_pipe_stdin")]
+    pub pipe_default_stdin: String,
+}
+
+fn default_macro_prefix() -> String {
+    ",".to_string()
+}
+
+fn default_pipe_stdin() -> String {
+    "body".to_string()
+}
+
+impl Default for MacroOptionsConfig {
+    fn default() -> Self {
+        Self {
+            prefix: default_macro_prefix(),
+            pipe_default_stdin: default_pipe_stdin(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,7 +404,58 @@ impl Config {
              # [[default_feeds]]\n\
              # url = \"https://private.example.com/feed.xml\"\n\
              # [default_feeds.headers]\n\
-             # Authorization = \"Bearer your_token_here\"\n",
+             # Authorization = \"Bearer your_token_here\"\n\
+             #\n\
+             # ── External-command hooks ──────────────────────────────\n\
+             #\n\
+             # Macros bind a key (invoked as <prefix><key>, default prefix is ',') to\n\
+             # an ordered chain of steps. Steps are separated by ';'. A trailing\n\
+             # ` -- \"description\"` overrides the help-overlay label.\n\
+             #\n\
+             # Step kinds:\n\
+             #   <action>                     run a built-in action (see list below)\n\
+             #   pipe-to \"cmd %u\" [stdin=…]   run `cmd %u` with article content on stdin\n\
+             #   exec    \"cmd %u\"             run `cmd %u` with no stdin\n\
+             #\n\
+             # Supported actions inside macros:\n\
+             #   open-in-browser, toggle-star, toggle-read, mark-all-read,\n\
+             #   refresh, toggle-theme, extract-links, help\n\
+             # Other keybinding actions are intentionally not callable from macros.\n\
+             #\n\
+             # Variables expanded per argv token:\n\
+             #   %t title  %u url  %a author  %d date  %f feed-title  %F feed-url  %% literal %\n\
+             #\n\
+             # IMPORTANT — commands are NOT run through a shell:\n\
+             #   * Templates are tokenized once and %X is substituted into argv tokens.\n\
+             #     Article content cannot break out of an argument.\n\
+             #   * For pipes, redirection, or globbing, write a small shell script\n\
+             #     and invoke that.\n\
+             #   * `~` and `$HOME` / `$VAR` are NOT expanded — use absolute paths.\n\
+             #   * Wrapping your command in `sh -c \"... %t ...\"` REINTRODUCES shell\n\
+             #     injection through item titles. Prefer a script file.\n\
+             #\n\
+             # Quoting: the outer parser is shell-style, so to put a quoted token in\n\
+             # the inner argv, escape twice:\n\
+             #   pipe-to \"echo \\\"hello world\\\"\"\n\
+             #\n\
+             # [macros]\n\
+             # y = 'open-in-browser ; pipe-to \"yt-dlp %u\"'\n\
+             # w = 'pipe-to \"wallabag-cli add %u\" -- \"Save to Wallabag\"'\n\
+             # n = 'pipe-to \"tee /tmp/out.txt\" stdin=metadata'\n\
+             #\n\
+             # [macro_options]\n\
+             # prefix = \",\"                  # the macro-prefix key\n\
+             # pipe_default_stdin = \"body\"   # body | title | url | metadata | none\n\
+             #\n\
+             # The exec_on_new hook fires once per newly-seen item on each refresh.\n\
+             # The first successful fetch of a feed seeds the seen set silently to\n\
+             # avoid a firehose on initial load. Children are spawned detached.\n\
+             # Semantics on crash are AT MOST ONCE — feedr persists the seen-set\n\
+             # before spawning, so a kill mid-fire loses a notification rather than\n\
+             # firing again on the next launch. Prefer idempotent commands.\n\
+             #\n\
+             # [hooks]\n\
+             # exec_on_new = 'notify-send \"New: %t\" \"%f\"'\n",
             toml
         )
     }
@@ -401,6 +492,47 @@ mod tests {
         let headers = config.default_feeds[1].headers.as_ref().unwrap();
         assert_eq!(headers.get("Authorization").unwrap(), "Bearer token123");
         assert_eq!(headers.get("X-Custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_hooks_and_macros_round_trip() {
+        let toml_str = r#"
+            [hooks]
+            exec_on_new = 'notify-send "New: %t" "%f"'
+
+            [macros]
+            y = 'open-in-browser ; pipe-to "yt-dlp %u"'
+
+            [macro_options]
+            prefix = ","
+            pipe_default_stdin = "metadata"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.hooks.exec_on_new.as_deref(),
+            Some(r#"notify-send "New: %t" "%f""#)
+        );
+        assert_eq!(
+            config.macros.get("y").map(String::as_str),
+            Some(r#"open-in-browser ; pipe-to "yt-dlp %u""#)
+        );
+        assert_eq!(config.macro_options.prefix, ",");
+        assert_eq!(config.macro_options.pipe_default_stdin, "metadata");
+    }
+
+    #[test]
+    fn test_config_back_compat_without_new_sections() {
+        // An old config file with no [hooks]/[macros]/[macro_options] must still load.
+        let toml_str = r#"
+            [general]
+            max_dashboard_items = 50
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.general.max_dashboard_items, 50);
+        assert!(config.hooks.exec_on_new.is_none());
+        assert!(config.macros.is_empty());
+        assert_eq!(config.macro_options.prefix, ",");
+        assert_eq!(config.macro_options.pipe_default_stdin, "body");
     }
 
     #[test]

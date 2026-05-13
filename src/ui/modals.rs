@@ -1,5 +1,5 @@
 use crate::app::{App, InputMode, LinkType, TimeFilter, View};
-use crate::keybindings::{key_display, KeyAction};
+use crate::keybindings::{binding_display, key_display, KeyAction, MacroStep};
 use crate::ui::utils::{centered_rect_with_min, truncate_str};
 use crate::ui::ColorScheme;
 use ratatui::{
@@ -800,6 +800,39 @@ pub(super) fn render_help_overlay<B: Backend>(f: &mut Frame<B>, app: &App, color
             lines.push(Line::from(Span::styled("  What's New", section_style)));
             lines.push(Line::from(""));
             add_key("Any key", "Dismiss and go to Dashboard", &mut lines);
+        }
+    }
+
+    if !app.macros.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(separator.clone());
+        lines.push(Line::from(""));
+        let prefix_label = binding_display(&app.macro_options.prefix);
+        lines.push(Line::from(Span::styled(
+            format!("  Macros (press {} then key)", prefix_label),
+            section_style,
+        )));
+        lines.push(Line::from(""));
+        for mac in &app.macros {
+            let trigger_str = format!("{}{}", prefix_label, binding_display(&mac.trigger));
+            let summary = match &mac.description {
+                Some(d) => d.clone(),
+                None => mac
+                    .steps
+                    .iter()
+                    .map(|s| match s {
+                        MacroStep::Action(a) => a.as_str().to_string(),
+                        MacroStep::PipeTo { argv_template, .. } => {
+                            format!("pipe-to {}", argv_template.join(" "))
+                        }
+                        MacroStep::Exec { argv_template } => {
+                            format!("exec {}", argv_template.join(" "))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ; "),
+            };
+            add_key(&trigger_str, &summary, &mut lines);
         }
     }
 

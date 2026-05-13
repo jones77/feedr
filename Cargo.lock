@@ -530,6 +530,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "shlex",
  "toml",
  "unicode-width 0.1.14",
  "url",

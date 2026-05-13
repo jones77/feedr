@@ -14,8 +14,11 @@
 //   - All text input modes (InsertUrl, SearchMode, CategoryNameInput)
 //   - Detail view: g/G and Ctrl+u/Ctrl+d for scrolling
 
-use crate::app::{AddFeedResult, App, CategoryAction, InputMode, TimeFilter, TreeItem, View};
-use crate::keybindings::KeyAction;
+use crate::app::{
+    expand_argv_template, make_pipe_payload, AddFeedResult, App, CategoryAction, InputMode,
+    TimeFilter, TreeItem, View,
+};
+use crate::keybindings::{KeyAction, MacroBinding, StdinKind};
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -50,41 +53,120 @@ fn handle_show_help(app: &mut App) {
 }
 
 fn handle_toggle_star_current(app: &mut App) {
-    if let Some(feed_idx) = app.selected_feed {
-        if let Some(item_idx) = app.selected_item {
-            match app.toggle_item_starred(feed_idx, item_idx) {
-                Ok(is_now_starred) => {
-                    app.success_message = Some(if is_now_starred {
-                        "\u{2605} Starred".to_string()
-                    } else {
-                        "\u{2606} Unstarred".to_string()
-                    });
-                    app.success_message_time = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    app.error = Some(format!("Failed to toggle star: {}", e));
-                }
-            }
+    let Some((feed_idx, item_idx)) = app.current_article_indices() else {
+        return;
+    };
+    match app.toggle_item_starred(feed_idx, item_idx) {
+        Ok(is_now_starred) => {
+            app.success_message = Some(if is_now_starred {
+                "\u{2605} Starred".to_string()
+            } else {
+                "\u{2606} Unstarred".to_string()
+            });
+            app.success_message_time = Some(std::time::Instant::now());
+        }
+        Err(e) => {
+            app.error = Some(format!("Failed to toggle star: {}", e));
         }
     }
 }
 
 fn handle_toggle_read_current(app: &mut App) {
-    if let Some(feed_idx) = app.selected_feed {
-        if let Some(item_idx) = app.selected_item {
-            match app.toggle_item_read(feed_idx, item_idx) {
-                Ok(is_now_read) => {
-                    app.success_message = Some(if is_now_read {
-                        "\u{2713} Marked as read".to_string()
-                    } else {
-                        "\u{25CB} Marked as unread".to_string()
-                    });
-                    app.success_message_time = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    app.error = Some(format!("Failed to toggle read status: {}", e));
+    let Some((feed_idx, item_idx)) = app.current_article_indices() else {
+        return;
+    };
+    match app.toggle_item_read(feed_idx, item_idx) {
+        Ok(is_now_read) => {
+            app.success_message = Some(if is_now_read {
+                "\u{2713} Marked as read".to_string()
+            } else {
+                "\u{25CB} Marked as unread".to_string()
+            });
+            app.success_message_time = Some(std::time::Instant::now());
+        }
+        Err(e) => {
+            app.error = Some(format!("Failed to toggle read status: {}", e));
+        }
+    }
+    // Re-filter so a `read_status = Some(false)` ("unread only") filter on the
+    // Dashboard drops the just-read item from the visible list. The Dashboard
+    // keypress used to do this inline; centralizing it here means macros and
+    // every other caller stay in sync.
+    app.apply_filters();
+}
+
+// ── Macro engine ───────────────────────────────────────────────────
+//
+// Macros are checked at the top of `handle_key_event` and bypass the
+// per-view dispatch entirely. ALL steps (Action / PipeTo / Exec) are
+// queued onto `app.pending_macro_steps` so they run in newsboat-style
+// sequential order. The TUI loop drains the queue after each
+// event-handling pass — actions mutate state inline, PipeTo suspends
+// the terminal, Exec spawns detached.
+
+/// Queue every step of a macro for the TUI drain in order.
+fn run_macro(app: &mut App, mac: &MacroBinding) {
+    for step in &mac.steps {
+        app.pending_macro_steps.push_back(step.clone());
+    }
+}
+
+/// Build the (argv, stdin payload) tuple for a queued PipeTo step using
+/// the current article context. Returns None if no article is focused.
+pub(crate) fn build_pipe_invocation(
+    app: &App,
+    argv_template: &[String],
+    stdin: StdinKind,
+) -> Option<(Vec<String>, Vec<u8>)> {
+    let ctx = app.current_article_context()?;
+    let argv = expand_argv_template(argv_template, &ctx);
+    let payload = make_pipe_payload(&ctx, stdin);
+    Some((argv, payload))
+}
+
+/// Build the argv for a queued Exec step using the current article context.
+/// Returns None if no article is focused.
+pub(crate) fn build_exec_invocation(app: &App, argv_template: &[String]) -> Option<Vec<String>> {
+    let ctx = app.current_article_context()?;
+    Some(expand_argv_template(argv_template, &ctx))
+}
+
+/// Run a `KeyAction` outside of normal key dispatch (called from the
+/// macro queue drain). Only a curated subset is supported — actions whose
+/// meaning is well-defined without view-specific input mode context.
+pub(crate) fn dispatch_action(app: &mut App, action: KeyAction) {
+    match action {
+        KeyAction::Refresh => handle_refresh(app),
+        KeyAction::ToggleTheme => handle_toggle_theme(app),
+        KeyAction::Help => handle_show_help(app),
+        KeyAction::ToggleStar => handle_toggle_star_current(app),
+        KeyAction::ToggleRead => handle_toggle_read_current(app),
+        KeyAction::OpenInBrowser => match app.current_article_context() {
+            Some(ctx) => {
+                if let Some(url) = ctx.url {
+                    if let Err(e) = open::that(url) {
+                        app.error = Some(format!("Failed to open link: {}", e));
+                    }
+                } else {
+                    app.error = Some("No URL on this article".to_string());
                 }
             }
+            None => app.error = Some("open-in-browser: no article in focus".to_string()),
+        },
+        KeyAction::MarkAllRead => match app.mark_all_dashboard_read() {
+            Ok(count) => {
+                app.success_message = Some(format!("\u{2713} Marked {} items as read", count));
+                app.success_message_time = Some(std::time::Instant::now());
+                app.apply_filters();
+            }
+            Err(e) => app.error = Some(format!("Failed to mark all read: {}", e)),
+        },
+        KeyAction::ExtractLinks => app.extract_links_from_current_item(),
+        other => {
+            app.error = Some(format!(
+                "macro: action '{}' not supported in macros",
+                other.as_str()
+            ));
         }
     }
 }
@@ -164,6 +246,42 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
     if app.key_matches(KeyAction::ForceQuit, &key) {
         return Ok(true);
     }
+
+    // Macro engine: handle the macro-prefix follow-up key, then check whether
+    // this key IS the macro prefix. Only active in Normal input mode so it
+    // never interferes with text-input or filter-cycling modes.
+    if app.input_mode == InputMode::Normal {
+        if app.awaiting_macro_key {
+            app.awaiting_macro_key = false;
+            app.awaiting_macro_key_since = None;
+            // Clear the "Macro prefix..." hint so it doesn't outlive the wait.
+            app.success_message = None;
+            app.success_message_time = None;
+            // ESC explicitly cancels; the key is consumed and nothing else fires.
+            if key.code == KeyCode::Esc {
+                return Ok(false);
+            }
+            match app.macro_for_key(&key) {
+                Some(mac) => {
+                    let mac = mac.clone();
+                    run_macro(app, &mac);
+                }
+                None => {
+                    app.error = Some("No macro bound to that key".to_string());
+                }
+            }
+            return Ok(false);
+        }
+        if app.macro_options.prefix.matches(&key) && !app.macros.is_empty() {
+            let now = std::time::Instant::now();
+            app.awaiting_macro_key = true;
+            app.awaiting_macro_key_since = Some(now);
+            app.success_message = Some("Macro prefix... press macro key".to_string());
+            app.success_message_time = Some(now);
+            return Ok(false);
+        }
+    }
+
     match app.input_mode {
         InputMode::Normal => match app.view {
             View::Dashboard => match key.code {
@@ -1814,5 +1932,181 @@ mod tests {
         let result = handle_key_event(&mut app, q).unwrap();
         assert!(!result);
         assert_eq!(app.view, View::FeedList);
+    }
+
+    // ── Macro engine tests ────────────────────────────────────────
+
+    #[test]
+    fn test_dispatch_action_rejects_unsupported_action() {
+        let mut app = make_test_app();
+        // MoveUp is intentionally not callable from macros — verify the error
+        // surfaces the friendly dashed name, not a debug-formatted variant.
+        dispatch_action(&mut app, KeyAction::MoveUp);
+        let err = app.error.as_deref().unwrap_or("");
+        assert!(err.contains("move-up"), "got error: {}", err);
+        assert!(err.contains("not supported"), "got error: {}", err);
+    }
+
+    #[test]
+    fn test_macro_prefix_esc_cancels_cleanly() {
+        let mut app = make_test_app();
+        // Bind a macro so the prefix is active.
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![crate::keybindings::MacroStep::Action(KeyAction::Refresh)],
+            description: None,
+        }];
+
+        // Press the prefix.
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        assert!(app.awaiting_macro_key);
+
+        // ESC must cancel without firing anything and without surfacing an error.
+        let esc = make_key(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert!(app.awaiting_macro_key_since.is_none());
+        assert!(
+            app.error.is_none(),
+            "ESC must not produce an error, got: {:?}",
+            app.error
+        );
+        assert!(app.pending_macro_steps.is_empty());
+    }
+
+    #[test]
+    fn test_macro_prefix_unknown_followup_errors_but_clears_state() {
+        let mut app = make_test_app();
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![crate::keybindings::MacroStep::Action(KeyAction::Refresh)],
+            description: None,
+        }];
+
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        // Press an unbound follow-up key. We surface an error rather than
+        // silently falling through to normal dispatch, but the prefix state
+        // must be cleared so subsequent keystrokes work normally.
+        let z = make_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        handle_key_event(&mut app, z).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert!(app.awaiting_macro_key_since.is_none());
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn test_macro_prefix_then_bound_key_queues_steps() {
+        let mut app = make_test_app();
+        app.macros = vec![crate::keybindings::MacroBinding {
+            trigger: crate::keybindings::KeyBinding::new(KeyCode::Char('y')),
+            steps: vec![
+                crate::keybindings::MacroStep::Action(KeyAction::ToggleStar),
+                crate::keybindings::MacroStep::Exec {
+                    argv_template: vec!["true".to_string()],
+                },
+            ],
+            description: None,
+        }];
+
+        let prefix = make_key(KeyCode::Char(','), KeyModifiers::NONE);
+        handle_key_event(&mut app, prefix).unwrap();
+        let y = make_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        handle_key_event(&mut app, y).unwrap();
+        assert!(!app.awaiting_macro_key);
+        assert_eq!(app.pending_macro_steps.len(), 2);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_star_works_in_dashboard_view() {
+        // Regression: dispatch_action used to read app.selected_feed, which is
+        // None in Dashboard view until the user drills into an item. The macro
+        // path silently no-op'd. After the fix, the focused dashboard item is
+        // resolved via current_article_indices() and toggling works.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        app.view = View::Dashboard;
+        app.selected_item = Some(0);
+        assert!(app.selected_feed.is_none(), "precondition for regression");
+        assert!(
+            !app.active_dashboard_items().is_empty(),
+            "make_test_app populates the dashboard"
+        );
+
+        dispatch_action(&mut app, KeyAction::ToggleStar);
+
+        assert_eq!(
+            app.starred_items.len(),
+            1,
+            "expected item to be starred via dispatch_action"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_read_works_in_starred_view() {
+        // Regression: same root cause as the Dashboard case — Starred view
+        // also leaves selected_feed unset.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        // Star one item so the Starred view has something to focus on.
+        app.toggle_item_starred(0, 0).unwrap();
+        app.view = View::Starred;
+        app.selected_item = Some(0);
+        app.selected_feed = None;
+        assert_eq!(
+            app.get_starred_dashboard_items().len(),
+            1,
+            "Starred view has one item to focus"
+        );
+
+        dispatch_action(&mut app, KeyAction::ToggleRead);
+
+        assert_eq!(
+            app.read_items.len(),
+            1,
+            "expected item to be marked read via dispatch_action"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
+    }
+
+    #[test]
+    fn test_dispatch_toggle_read_reapplies_filters_on_dashboard() {
+        // Regression: a `,r = toggle-read` macro on the Dashboard with the
+        // "unread only" filter active must remove the just-read item from the
+        // visible list. Previously dispatch_action -> handle_toggle_read_current
+        // skipped apply_filters(), so the dashboard kept showing stale state
+        // until the next filter change.
+        let mut app = make_test_app();
+        app.read_items.clear();
+        app.starred_items.clear();
+        app.view = View::Dashboard;
+
+        // Activate "unread only" filter, then materialize the filtered list.
+        app.filter_options.read_status = Some(false);
+        app.apply_filters();
+        let before = app.active_dashboard_items().len();
+        assert!(
+            before > 0,
+            "precondition: dashboard has unread items to filter on"
+        );
+        app.selected_item = Some(0);
+
+        dispatch_action(&mut app, KeyAction::ToggleRead);
+
+        assert_eq!(
+            app.read_items.len(),
+            1,
+            "item should be marked read via dispatch_action"
+        );
+        assert_eq!(
+            app.active_dashboard_items().len(),
+            before - 1,
+            "the just-read item must drop out of the unread-only filter"
+        );
+        assert!(app.error.is_none(), "should not error: {:?}", app.error);
     }
 }

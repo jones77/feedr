@@ -4,7 +4,7 @@ use crate::ui::ColorScheme;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -120,6 +120,41 @@ pub struct App {
     pub feed_tree: Vec<TreeItem>,
     pub selected_tree_item: Option<usize>, // index into feed_tree
     pub keybindings: crate::keybindings::KeyBindingMap,
+    pub macros: Vec<crate::keybindings::MacroBinding>,
+    pub macro_options: crate::keybindings::MacroOptions,
+    /// True after the macro-prefix key has been pressed and we are awaiting the next key.
+    pub awaiting_macro_key: bool,
+    /// When `awaiting_macro_key` was last set, so the TUI tick loop can time
+    /// it out (reusing the 1.5 s success-message timeout) rather than
+    /// stranding the prefix state across an idle period.
+    pub awaiting_macro_key_since: Option<Instant>,
+    /// Item IDs that exec_on_new has already fired for (persisted).
+    pub seen_items: HashSet<String>,
+    /// Feed URLs whose first successful fetch has been observed (persisted).
+    pub feeds_seeded: HashSet<String>,
+    /// FIFO queue of macro steps awaiting execution. Filled by the macro
+    /// engine in `events.rs`; drained in order by the TUI run loop after
+    /// each event-handling pass. Steps include Actions (which mutate app
+    /// state) and PipeTo/Exec (which spawn children). Draining happens at
+    /// the loop level because PipeTo needs the terminal handle to suspend
+    /// the TUI, which `handle_events` does not have access to.
+    pub pending_macro_steps: VecDeque<crate::keybindings::MacroStep>,
+    /// Pre-tokenized `[hooks].exec_on_new` template. `None` if the hook is
+    /// disabled or the template failed to tokenize at startup (in which case
+    /// a startup warning is surfaced).
+    pub exec_on_new_template: Option<Vec<String>>,
+}
+
+/// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
+#[derive(Clone, Debug)]
+pub struct ArticleContext<'a> {
+    pub title: &'a str,
+    pub url: Option<&'a str>,
+    pub author: Option<&'a str>,
+    pub formatted_date: Option<&'a str>,
+    pub feed_title: &'a str,
+    pub feed_url: &'a str,
+    pub plain_text: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +200,13 @@ struct SavedData {
     starred_items: HashSet<String>,
     #[serde(default)]
     last_session_time: Option<String>,
+    /// Item IDs (same scheme as `read_items`) that exec_on_new has already fired for.
+    #[serde(default)]
+    seen_items: HashSet<String>,
+    /// Feed URLs whose first successful fetch has been observed. Items from a
+    /// feed not in this set are seeded into `seen_items` silently.
+    #[serde(default)]
+    feeds_seeded: HashSet<String>,
 }
 
 impl Default for App {
@@ -187,6 +229,8 @@ impl App {
             read_items: HashSet::new(),
             starred_items: HashSet::new(),
             last_session_time: None,
+            seen_items: HashSet::new(),
+            feeds_seeded: HashSet::new(),
         });
 
         // Seed bookmarks from default_feeds if no saved bookmarks exist
@@ -222,6 +266,30 @@ impl App {
         let show_summary = last_session_time.is_some() && has_bookmarks;
 
         let (keybindings, kb_warnings) = crate::keybindings::build_keybindings(&config.keybindings);
+        let (macro_options, mo_warnings) = crate::keybindings::resolve_macro_options(
+            &config.macro_options.prefix,
+            &config.macro_options.pipe_default_stdin,
+        );
+        let (macros, mac_warnings) =
+            crate::keybindings::build_macros(&config.macros, &macro_options);
+
+        // Pre-tokenize the exec_on_new template once at startup so we don't
+        // re-shlex on every feed arrival, and surface tokenization errors as a
+        // startup warning instead of an unexpected runtime failure later.
+        let mut hook_warnings: Vec<String> = Vec::new();
+        let exec_on_new_template = config
+            .hooks
+            .exec_on_new
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|t| match shlex::split(t) {
+                Some(toks) if !toks.is_empty() => Some(toks),
+                _ => {
+                    hook_warnings.push(format!("exec_on_new: could not tokenize: {}", t));
+                    None
+                }
+            });
 
         let mut app = Self {
             config,
@@ -275,13 +343,25 @@ impl App {
             feed_tree: Vec::new(),
             selected_tree_item: None,
             keybindings,
+            macros,
+            macro_options,
+            awaiting_macro_key: false,
+            awaiting_macro_key_since: None,
+            seen_items: saved_data.seen_items,
+            feeds_seeded: saved_data.feeds_seeded,
+            pending_macro_steps: VecDeque::new(),
+            exec_on_new_template,
         };
 
         app.update_dashboard();
         app.rebuild_feed_tree();
 
-        if !kb_warnings.is_empty() {
-            app.error = Some(format!("Keybinding config: {}", kb_warnings.join("; ")));
+        let mut all_warnings = kb_warnings;
+        all_warnings.extend(mo_warnings);
+        all_warnings.extend(mac_warnings);
+        all_warnings.extend(hook_warnings);
+        if !all_warnings.is_empty() {
+            app.error = Some(format!("Config: {}", all_warnings.join("; ")));
         }
 
         app
@@ -354,6 +434,8 @@ impl App {
                 read_items: HashSet::new(),
                 starred_items: HashSet::new(),
                 last_session_time: None,
+                seen_items: HashSet::new(),
+                feeds_seeded: HashSet::new(),
             });
         }
 
@@ -374,6 +456,8 @@ impl App {
             read_items: self.read_items.clone(),
             starred_items: self.starred_items.clone(),
             last_session_time: Some(Utc::now().to_rfc3339()),
+            seen_items: self.seen_items.clone(),
+            feeds_seeded: self.feeds_seeded.clone(),
         };
 
         let json = serde_json::to_string(&saved_data)?;
@@ -598,10 +682,7 @@ impl App {
     pub(crate) fn get_item_id(&self, feed_idx: usize, item_idx: usize) -> String {
         if let Some(feed) = self.feeds.get(feed_idx) {
             if let Some(item) = feed.items.get(item_idx) {
-                if let Some(link) = &item.link {
-                    return link.clone();
-                }
-                return format!("{}_{}", feed.url, item.title);
+                return make_item_id(feed, item);
             }
         }
         String::new()
@@ -821,6 +902,16 @@ impl App {
         if let Some(idx) = self.selected_feed {
             if idx < self.feeds.len() {
                 let url = self.feeds[idx].url.clone();
+
+                // Drop this feed's exec_on_new tracking state before removing
+                // the feed itself — otherwise the URL would stay in
+                // feeds_seeded and its item IDs would stay in seen_items
+                // forever, growing the persisted JSON file monotonically.
+                self.feeds_seeded.remove(&url);
+                for item in &self.feeds[idx].items {
+                    let id = make_item_id(&self.feeds[idx], item);
+                    self.seen_items.remove(&id);
+                }
 
                 // Remove from feeds
                 self.feeds.remove(idx);
@@ -1549,6 +1640,193 @@ impl App {
             self.error = Some("No links or images found in this article".to_string());
         }
     }
+
+    /// Resolve `(feed_idx, item_idx)` for the focused article in the current
+    /// view. Dashboard and Starred views derive the indices from their derived
+    /// item list rather than from `selected_feed` (which is only populated
+    /// once the user drills into FeedItems / FeedItemDetail). This is the
+    /// single source of truth for "which item is focused right now".
+    pub fn current_article_indices(&self) -> Option<(usize, usize)> {
+        match self.view {
+            View::Dashboard => {
+                let sel = self.selected_item?;
+                let active = self.active_dashboard_items();
+                if sel >= active.len() {
+                    return None;
+                }
+                Some(active[sel])
+            }
+            View::FeedItems | View::FeedItemDetail => {
+                Some((self.selected_feed?, self.selected_item?))
+            }
+            View::Starred => {
+                let sel = self.selected_item?;
+                let starred = self.get_starred_dashboard_items();
+                if sel >= starred.len() {
+                    return None;
+                }
+                Some(starred[sel])
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the focused article based on the current view + selection.
+    /// Returns None if nothing is selected or the indices don't resolve.
+    pub fn current_article_context(&self) -> Option<ArticleContext<'_>> {
+        let (feed_idx, item_idx) = self.current_article_indices()?;
+        let feed = self.feeds.get(feed_idx)?;
+        let item = feed.items.get(item_idx)?;
+        Some(ArticleContext {
+            title: &item.title,
+            url: item.link.as_deref(),
+            author: item.author.as_deref(),
+            formatted_date: item.formatted_date.as_deref(),
+            feed_title: &feed.title,
+            feed_url: &feed.url,
+            plain_text: item.plain_text.as_deref(),
+        })
+    }
+
+    /// Look up a macro whose trigger matches the given key event.
+    pub fn macro_for_key(
+        &self,
+        key: &crossterm::event::KeyEvent,
+    ) -> Option<&crate::keybindings::MacroBinding> {
+        self.macros.iter().find(|m| m.trigger.matches(key))
+    }
+}
+
+/// Build an `ArticleContext` directly from a `Feed` + `FeedItem` pair —
+/// the path used by `exec_on_new`, where the new item may not yet live
+/// inside `App::feeds`.
+pub fn article_context_from<'a>(feed: &'a Feed, item: &'a FeedItem) -> ArticleContext<'a> {
+    ArticleContext {
+        title: &item.title,
+        url: item.link.as_deref(),
+        author: item.author.as_deref(),
+        formatted_date: item.formatted_date.as_deref(),
+        feed_title: &feed.title,
+        feed_url: &feed.url,
+        plain_text: item.plain_text.as_deref(),
+    }
+}
+
+/// Build the same identifier scheme used by `read_items`/`starred_items` from
+/// a feed + item that may not yet be in `App::feeds`.
+pub fn make_item_id(feed: &Feed, item: &FeedItem) -> String {
+    if let Some(link) = &item.link {
+        return link.clone();
+    }
+    format!("{}_{}", feed.url, item.title)
+}
+
+/// Update `seen_items` and `feeds_seeded` to reflect this feed having been
+/// successfully fetched. Returns the indices into `feed.items` of items
+/// that are newly seen *and should fire exec_on_new*. On the first
+/// successful fetch of a feed (URL not yet in `feeds_seeded`), the seen
+/// set is populated silently and an empty Vec is returned.
+pub fn mark_feed_seen(app: &mut App, feed: &Feed) -> Vec<usize> {
+    let is_first_fetch = !app.feeds_seeded.contains(&feed.url);
+    let mut newly_seen = Vec::new();
+    for (idx, item) in feed.items.iter().enumerate() {
+        let id = make_item_id(feed, item);
+        let inserted = app.seen_items.insert(id);
+        if inserted && !is_first_fetch {
+            newly_seen.push(idx);
+        }
+    }
+    // Only flip the seeded bit on a fetch that actually returned items. A
+    // transiently-empty first fetch (server hiccup, parser edge case) would
+    // otherwise mark the feed as seeded with no items recorded; the next
+    // non-empty fetch would then treat every item as new and firehose
+    // exec_on_new for the entire backlog.
+    if is_first_fetch && !feed.items.is_empty() {
+        app.feeds_seeded.insert(feed.url.clone());
+    }
+    newly_seen
+}
+
+/// Substitute newsboat-style %X placeholders into each argv token. Untrusted
+/// content is never interpreted by a shell — placeholders are inserted
+/// verbatim into individual argv elements.
+///
+/// Variables: %t title, %u url, %a author, %d formatted-date,
+///            %f feed-title, %F feed-url, %% literal %.
+pub fn expand_argv_template(template: &[String], ctx: &ArticleContext<'_>) -> Vec<String> {
+    template
+        .iter()
+        .map(|tok| expand_one_token(tok, ctx))
+        .collect()
+}
+
+fn expand_one_token(tok: &str, ctx: &ArticleContext<'_>) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut chars = tok.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('t') => out.push_str(ctx.title),
+            Some('u') => out.push_str(ctx.url.unwrap_or("")),
+            Some('a') => out.push_str(ctx.author.unwrap_or("")),
+            Some('d') => out.push_str(ctx.formatted_date.unwrap_or("")),
+            Some('f') => out.push_str(ctx.feed_title),
+            Some('F') => out.push_str(ctx.feed_url),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Build the byte payload that gets piped to a `pipe-to` child's stdin.
+pub fn make_pipe_payload(ctx: &ArticleContext<'_>, kind: crate::keybindings::StdinKind) -> Vec<u8> {
+    use crate::keybindings::StdinKind;
+    match kind {
+        StdinKind::None => Vec::new(),
+        StdinKind::Title => ctx.title.as_bytes().to_vec(),
+        StdinKind::Url => ctx.url.unwrap_or("").as_bytes().to_vec(),
+        StdinKind::Body => ctx
+            .plain_text
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default(),
+        StdinKind::Metadata => {
+            let mut out = String::new();
+            out.push_str("Title: ");
+            out.push_str(ctx.title);
+            out.push('\n');
+            if let Some(u) = ctx.url {
+                out.push_str("URL: ");
+                out.push_str(u);
+                out.push('\n');
+            }
+            if let Some(a) = ctx.author {
+                out.push_str("Author: ");
+                out.push_str(a);
+                out.push('\n');
+            }
+            if let Some(d) = ctx.formatted_date {
+                out.push_str("Date: ");
+                out.push_str(d);
+                out.push('\n');
+            }
+            out.push_str("Feed: ");
+            out.push_str(ctx.feed_title);
+            out.push('\n');
+            out.push('\n');
+            if let Some(body) = ctx.plain_text {
+                out.push_str(body);
+            }
+            out.into_bytes()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2044,5 +2322,269 @@ mod tests {
 
         assert_eq!(app.extracted_links.len(), 1);
         assert_eq!(app.extracted_links[0].url, "https://example.com/about");
+    }
+
+    fn synthetic_ctx() -> ArticleContext<'static> {
+        ArticleContext {
+            title: "Hello %u world",
+            url: Some("https://ex.com/a"),
+            author: Some("Alice"),
+            formatted_date: Some("2 hours ago"),
+            feed_title: "Example",
+            feed_url: "https://ex.com/feed.xml",
+            plain_text: Some("body text"),
+        }
+    }
+
+    #[test]
+    fn test_expand_argv_template_per_token() {
+        let tmpl = vec![
+            "yt-dlp".to_string(),
+            "%u".to_string(),
+            "--title=%t".to_string(),
+        ];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx());
+        assert_eq!(argv[0], "yt-dlp");
+        // The url replaces %u literally — but the title contains a %u which
+        // must NOT be re-expanded (we only expand once, in the template, not
+        // in the substituted content).
+        assert_eq!(argv[1], "https://ex.com/a");
+        assert_eq!(argv[2], "--title=Hello %u world");
+    }
+
+    #[test]
+    fn test_expand_argv_template_percent_literal_and_unknown() {
+        let tmpl = vec!["a%%b".to_string(), "x%zy".to_string()];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx());
+        assert_eq!(argv[0], "a%b");
+        // Unknown escapes are passed through verbatim.
+        assert_eq!(argv[1], "x%zy");
+    }
+
+    #[test]
+    fn test_make_pipe_payload_kinds() {
+        use crate::keybindings::StdinKind;
+        let ctx = synthetic_ctx();
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::None), Vec::<u8>::new());
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Title), b"Hello %u world");
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Url), b"https://ex.com/a");
+        assert_eq!(make_pipe_payload(&ctx, StdinKind::Body), b"body text");
+        let metadata = make_pipe_payload(&ctx, StdinKind::Metadata);
+        let s = String::from_utf8(metadata).unwrap();
+        assert!(s.contains("Title: Hello %u world"));
+        assert!(s.contains("URL: https://ex.com/a"));
+        assert!(s.contains("Author: Alice"));
+        assert!(s.contains("Feed: Example"));
+        assert!(s.ends_with("body text"));
+    }
+
+    fn synthetic_feed(url: &str, item_titles: &[&str]) -> Feed {
+        let items = item_titles
+            .iter()
+            .map(|t| FeedItem {
+                title: t.to_string(),
+                link: Some(format!("https://ex.com/a/{}", t)),
+                description: None,
+                pub_date: None,
+                author: None,
+                formatted_date: None,
+                parsed_date: None,
+                plain_text: None,
+                title_lower: t.to_lowercase(),
+            })
+            .collect();
+        Feed {
+            url: url.to_string(),
+            title: "Example".to_string(),
+            items,
+            title_lower: "example".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_mark_feed_seen_first_fetch_seeds_silently() {
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+
+        let newly = mark_feed_seen(&mut app, &feed);
+        assert!(
+            newly.is_empty(),
+            "first fetch must return no newly-seen items"
+        );
+        assert_eq!(app.seen_items.len(), 3);
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+    }
+
+    #[test]
+    fn test_mark_feed_seen_second_fetch_returns_only_new() {
+        let mut app = App::new();
+        let feed_v1 = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        mark_feed_seen(&mut app, &feed_v1);
+
+        let feed_v2 = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C", "D"]);
+        let newly = mark_feed_seen(&mut app, &feed_v2);
+        // Indices 2 and 3 (C, D) are new; A and B are already seen.
+        assert_eq!(newly, vec![2, 3]);
+        assert_eq!(app.seen_items.len(), 4);
+    }
+
+    #[test]
+    fn test_mark_feed_seen_no_changes_returns_empty() {
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        mark_feed_seen(&mut app, &feed);
+        let newly = mark_feed_seen(&mut app, &feed);
+        assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn test_mark_feed_seen_distinct_feeds_independent() {
+        let mut app = App::new();
+        let feed_a = synthetic_feed("https://ex.com/a.xml", &["A1"]);
+        let feed_b = synthetic_feed("https://ex.com/b.xml", &["B1"]);
+        // First fetches both seed silently.
+        assert!(mark_feed_seen(&mut app, &feed_a).is_empty());
+        assert!(mark_feed_seen(&mut app, &feed_b).is_empty());
+        assert!(app.feeds_seeded.contains("https://ex.com/a.xml"));
+        assert!(app.feeds_seeded.contains("https://ex.com/b.xml"));
+    }
+
+    #[test]
+    fn test_mark_feed_seen_empty_first_fetch_does_not_seed() {
+        // Regression: a transiently-empty first fetch must not flip
+        // feeds_seeded. If it did, the next non-empty fetch would be treated
+        // as "subsequent" and fire exec_on_new for every backlog item — the
+        // exact firehose the first-fetch suppression exists to prevent.
+        let mut app = App::new();
+        let empty = synthetic_feed("https://ex.com/feed.xml", &[]);
+
+        let newly = mark_feed_seen(&mut app, &empty);
+        assert!(newly.is_empty());
+        assert!(
+            !app.feeds_seeded.contains("https://ex.com/feed.xml"),
+            "empty fetch must NOT mark feed as seeded"
+        );
+
+        // The next fetch — now with items — is still the first real fetch
+        // and must seed silently.
+        let with_items = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+        let newly = mark_feed_seen(&mut app, &with_items);
+        assert!(
+            newly.is_empty(),
+            "first non-empty fetch must seed silently, not fire"
+        );
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+        assert_eq!(app.seen_items.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_current_feed_cleans_up_tracking_state() {
+        // Regression: feed removal used to leave the URL in feeds_seeded and
+        // every item ID in seen_items forever, growing the persisted JSON
+        // file monotonically across feed churn.
+        let mut app = App::new();
+        let feed = synthetic_feed("https://ex.com/feed.xml", &["A", "B"]);
+        let item_ids: Vec<String> = feed.items.iter().map(|i| make_item_id(&feed, i)).collect();
+
+        // Seed the tracking state as if exec_on_new had run for this feed.
+        mark_feed_seen(&mut app, &feed);
+        let second = synthetic_feed("https://ex.com/feed.xml", &["A", "B", "C"]);
+        mark_feed_seen(&mut app, &second);
+        assert!(app.feeds_seeded.contains("https://ex.com/feed.xml"));
+        for id in &item_ids {
+            assert!(app.seen_items.contains(id), "precondition: {} seen", id);
+        }
+
+        // Install the feed and trigger removal via the public path.
+        app.bookmarks.push("https://ex.com/feed.xml".to_string());
+        app.feeds.push(second);
+        app.selected_feed = Some(0);
+        app.remove_current_feed().unwrap();
+
+        assert!(
+            !app.feeds_seeded.contains("https://ex.com/feed.xml"),
+            "URL must be dropped from feeds_seeded"
+        );
+        for id in &item_ids {
+            assert!(
+                !app.seen_items.contains(id),
+                "item id {} must be dropped from seen_items",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn test_make_item_id_prefers_link() {
+        let mut feed = Feed {
+            url: "https://ex.com/feed.xml".to_string(),
+            title: "Example".to_string(),
+            items: vec![],
+            title_lower: "example".to_string(),
+        };
+        let item = FeedItem {
+            title: "T".to_string(),
+            link: Some("https://ex.com/a".to_string()),
+            description: None,
+            pub_date: None,
+            author: None,
+            formatted_date: None,
+            parsed_date: None,
+            plain_text: None,
+            title_lower: "t".to_string(),
+        };
+        feed.items.push(item.clone());
+        assert_eq!(make_item_id(&feed, &item), "https://ex.com/a");
+        let mut item2 = item.clone();
+        item2.link = None;
+        item2.title = "T2".to_string();
+        assert_eq!(make_item_id(&feed, &item2), "https://ex.com/feed.xml_T2");
+    }
+
+    #[test]
+    fn test_saved_data_seen_items_feeds_seeded_roundtrip() {
+        // Verify that the new persistence fields survive a JSON round-trip
+        // with the same shape the App expects.
+        let mut seen_items = HashSet::new();
+        seen_items.insert("https://ex.com/a".to_string());
+        seen_items.insert("https://ex.com/feed.xml_T2".to_string());
+        let mut feeds_seeded = HashSet::new();
+        feeds_seeded.insert("https://ex.com/feed.xml".to_string());
+
+        let original = SavedData {
+            bookmarks: vec!["https://ex.com/feed.xml".to_string()],
+            categories: vec![],
+            read_items: HashSet::new(),
+            starred_items: HashSet::new(),
+            last_session_time: None,
+            seen_items: seen_items.clone(),
+            feeds_seeded: feeds_seeded.clone(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: SavedData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.seen_items, seen_items);
+        assert_eq!(parsed.feeds_seeded, feeds_seeded);
+    }
+
+    #[test]
+    fn test_saved_data_back_compat_without_new_fields() {
+        // An older feedr_data.json with no seen_items / feeds_seeded must
+        // still deserialize (defaults to empty sets), so users who upgrade
+        // mid-flight don't lose their bookmarks.
+        let json = r#"{
+            "bookmarks": ["https://ex.com/feed.xml"],
+            "categories": [],
+            "read_items": [],
+            "starred_items": []
+        }"#;
+        let parsed: SavedData = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.bookmarks,
+            vec!["https://ex.com/feed.xml".to_string()]
+        );
+        assert!(parsed.seen_items.is_empty());
+        assert!(parsed.feeds_seeded.is_empty());
     }
 }
