@@ -1211,6 +1211,7 @@ mod tests {
 
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     /// Spawn a one-shot HTTP stub on 127.0.0.1 that writes `response_bytes`
@@ -1346,6 +1347,74 @@ mod tests {
             msg.contains("failed to fetch") || msg.contains("dns") || msg.contains("resolve"),
             "expected a network failure from following the public redirect, got: {}",
             msg
+        );
+    }
+
+    /// Like `spawn_stub_server`, but also captures the raw bytes of the
+    /// first request the stub receives and ships them back through an mpsc
+    /// channel. Lets a test assert on what `extract_article` actually puts
+    /// on the wire (headers, path, etc.) — vs. just what it returns.
+    fn spawn_capturing_stub_server(response_bytes: Vec<u8>) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // 8 KiB is plenty for a GET request with our headers; we
+                // only need enough to inspect the header block.
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                buf.truncate(n);
+                let _ = tx.send(buf);
+                let _ = stream.write_all(&response_bytes);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{}/", port), rx)
+    }
+
+    /// Regression lock for the "no per-feed Authorization on extraction" rule.
+    /// The function signature deliberately omits a headers parameter, but
+    /// nothing today fails loudly if a future refactor adds
+    /// `Authorization` to the static header list. This test inspects the
+    /// raw bytes on the wire and asserts that no `Authorization` header
+    /// is sent — third-party article hosts must not see per-feed bearer
+    /// tokens / cookies.
+    #[test]
+    fn test_extract_article_does_not_send_authorization_header() {
+        let body = fixture_article_html();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n{}",
+            body.len(),
+            body
+        );
+        let (url, captured) = spawn_capturing_stub_server(resp.into_bytes());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Outcome is irrelevant — we only care about what hit the wire.
+        let _ = extract_article(&url, &client, None);
+        let raw = captured
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stub must have captured a request");
+        let request = String::from_utf8_lossy(&raw);
+        // Header-name comparison is case-insensitive (RFC 7230 §3.2).
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            !lower.contains("\r\nauthorization:") && !lower.starts_with("authorization:"),
+            "extract_article must NOT forward an Authorization header — saw it in request:\n{}",
+            request
+        );
+        // Sanity: confirm we captured a real request, not just an empty read.
+        assert!(
+            lower.starts_with("get /"),
+            "expected a GET request, got: {}",
+            request
         );
     }
 }

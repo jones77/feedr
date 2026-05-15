@@ -659,7 +659,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // so a long backlog can't shrink the effective pool. The matching
         // saturating sub in the worker's exit path makes a spurious wake-up
         // (worker actually still alive, finishes later) safe — at worst we
-        // transiently overcommit by one slot, never underflow.
+        // transiently overcommit by up to `EXTRACTION_MAX_INFLIGHT` slots
+        // (every "released-but-still-alive" worker contributes one slot of
+        // over-commit until it actually exits), never underflow.
         let pruned = app
             .prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
         for _ in 0..pruned {
@@ -923,6 +925,94 @@ mod tests {
         // Auto path must always tag the request safe_redirects=true so the
         // worker picks the redirect-revalidating client.
         assert!(app.pending_extraction_requests[0].safe_redirects);
+    }
+
+    /// Regression lock: `enqueue_fulltext_for_new` must short-circuit on
+    /// items that already have ANY extraction state (Ready / Failed /
+    /// Pending). The contract lives in `request_extraction`'s
+    /// `contains_key` guard, but it's load-bearing — without it, a refresh
+    /// would re-extract every Ready item on every cycle (burning bandwidth,
+    /// thrashing the LRU) and double-queue Pending items for in-flight
+    /// workers.
+    #[test]
+    fn test_enqueue_fulltext_for_new_short_circuits_on_existing_state() {
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("Cached-Ready", Some("https://ex.com/ready")),
+                ("Cached-Failed", Some("https://ex.com/failed")),
+                ("Cached-Pending", Some("https://ex.com/pending")),
+                ("Fresh", Some("https://ex.com/fresh")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+
+        let id_ready = crate::app::make_item_id(&feed, &feed.items[0]);
+        let id_failed = crate::app::make_item_id(&feed, &feed.items[1]);
+        let id_pending = crate::app::make_item_id(&feed, &feed.items[2]);
+
+        // Drive Ready: Pending → record_extraction_result(Ok).
+        app.request_extraction(
+            id_ready.clone(),
+            "https://ex.com/ready".to_string(),
+            true,
+            false,
+        );
+        let gen = match app.extracted.get(&id_ready) {
+            Some(ExtractionState::Pending { generation, .. }) => *generation,
+            other => panic!("expected Pending, got {:?}", other),
+        };
+        app.record_extraction_result(
+            id_ready,
+            gen,
+            Ok(ExtractedArticle {
+                title: "T".into(),
+                plain_text: "body".into(),
+                byline: None,
+                site_name: None,
+                source_url: "https://ex.com/ready".into(),
+            }),
+        );
+
+        // Drive Failed: Pending → record_extraction_result(Err).
+        app.request_extraction(
+            id_failed.clone(),
+            "https://ex.com/failed".to_string(),
+            true,
+            false,
+        );
+        let gen = match app.extracted.get(&id_failed) {
+            Some(ExtractionState::Pending { generation, .. }) => *generation,
+            other => panic!("expected Pending, got {:?}", other),
+        };
+        app.record_extraction_result(id_failed, gen, Err(anyhow::anyhow!("boom")));
+
+        // Drive Pending: just leave it.
+        app.request_extraction(
+            id_pending,
+            "https://ex.com/pending".to_string(),
+            true,
+            false,
+        );
+
+        // Clear the queue so we only observe what the next call adds.
+        app.pending_extraction_requests.clear();
+
+        // Re-observe ALL four items. Only the Fresh one should be queued —
+        // the other three already have state and must be skipped.
+        enqueue_fulltext_for_new(&mut app, &feed, &[0, 1, 2, 3]);
+
+        assert_eq!(
+            app.pending_extraction_requests.len(),
+            1,
+            "items with existing extraction state must not be re-queued"
+        );
+        assert_eq!(
+            app.pending_extraction_requests[0].url, "https://ex.com/fresh",
+            "only the fresh item should be queued"
+        );
     }
 
     #[test]

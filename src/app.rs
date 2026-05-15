@@ -275,6 +275,14 @@ pub struct ExtractionRequest {
 /// feed could otherwise accumulate state monotonically across a long
 /// session. Insertion-order LRU eviction (oldest cache entries are dropped
 /// first) — `extracted_order` tracks the insertion sequence.
+///
+/// Soft cap, not hard: `insert_extraction` refuses to evict
+/// `Pending { spawned: true }` slots — evicting one would hide it from the
+/// stale-Pending watchdog (which only looks at `extracted`) and leak the
+/// worker's inflight permit if the worker is dead. The number of such slots
+/// at any moment is bounded by the worker-pool size (see
+/// `EXTRACTION_MAX_INFLIGHT` in `tui.rs`), so the effective cap grows by at
+/// most that constant.
 pub const EXTRACTED_CACHE_CAP: usize = 500;
 
 /// Stale-`Pending` watchdog timeout, as a multiple of `http_timeout`. A worker
@@ -1951,7 +1959,13 @@ impl App {
             if spawned {
                 spawned_pruned += 1;
             }
-            self.insert_extraction(id, ExtractionState::Failed("timed out".to_string()));
+            // Mutate in place — must NOT route through `insert_extraction`,
+            // which promotes the entry to MRU. A watchdog-failed slot is
+            // strictly less useful than newer Ready entries, so it should
+            // keep its original LRU position and be evicted ahead of them.
+            if let Some(state) = self.extracted.get_mut(&id) {
+                *state = ExtractionState::Failed("timed out".to_string());
+            }
         }
         spawned_pruned
     }
@@ -1993,15 +2007,34 @@ impl App {
             self.extracted_order.push_back(id);
             return;
         }
-        // Hard cap: evict the oldest entry unconditionally. If that entry
-        // happens to be `Pending`, the worker's eventual write-back will be
-        // dropped by `record_extraction_result`'s staleness check — so we
-        // never grow past EXTRACTED_CACHE_CAP, and we never resurrect an
-        // evicted slot.
+        // LRU eviction with a soft-protect for `Pending { spawned: true }`
+        // slots. Evicting a spawned Pending would hide the slot from the
+        // stale-Pending watchdog (it iterates `extracted`), leaving a dead
+        // worker's inflight permit leaked for the rest of the session.
+        // Skip those slots and evict the next-oldest evictable entry.
+        //
+        // The protected-slot count is bounded by the worker pool (see
+        // `EXTRACTION_MAX_INFLIGHT` in `tui.rs`), so the cache size is
+        // bounded at `EXTRACTED_CACHE_CAP + EXTRACTION_MAX_INFLIGHT` — a
+        // soft cap, not hard, but still strictly bounded. If every entry
+        // happens to be a spawned Pending (would mean the entire pool has
+        // been stuck for a long time), the cache transiently grows past
+        // CAP; the watchdog will eventually flip those slots to Failed,
+        // restoring evictability on the next insert.
         while self.extracted_order.len() >= EXTRACTED_CACHE_CAP {
-            match self.extracted_order.pop_front() {
-                Some(evict) => {
-                    self.extracted.remove(&evict);
+            let evict_idx = self.extracted_order.iter().position(|id| {
+                !matches!(
+                    self.extracted.get(id),
+                    Some(ExtractionState::Pending { spawned: true, .. })
+                )
+            });
+            match evict_idx {
+                Some(idx) => {
+                    // `VecDeque::remove` is O(N) for arbitrary indices,
+                    // but N ≤ ~500 and eviction only fires at the cap.
+                    if let Some(evict) = self.extracted_order.remove(idx) {
+                        self.extracted.remove(&evict);
+                    }
                 }
                 None => break,
             }
@@ -3534,6 +3567,115 @@ mod tests {
         assert!(
             !app.show_extracted,
             "repeated syncs must not wipe the toggle"
+        );
+    }
+
+    /// Regression lock for the LRU-vs-watchdog leak: evicting a Pending slot
+    /// whose `spawned` flag is true would hide it from
+    /// `prune_stale_pending_extractions` (which only iterates `extracted`),
+    /// so a silently-dead worker's inflight permit would leak for the rest
+    /// of the session. `insert_extraction` must skip such slots during
+    /// eviction and evict the next-oldest evictable entry.
+    #[test]
+    fn test_lru_eviction_skips_spawned_pending_slots() {
+        let mut app = App::new();
+        // Seed one spawned-Pending slot at the head of the LRU. Real callers
+        // would have inserted via `request_extraction` then flipped `spawned`
+        // via `mark_extraction_spawned`; we do the same here.
+        app.request_extraction(
+            "spawned_head".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "spawned_head");
+        app.mark_extraction_spawned("spawned_head", gen);
+        // Fill the rest of the cap with Ready entries (insertion-order LRU
+        // puts them all behind the spawned head).
+        for i in 0..EXTRACTED_CACHE_CAP - 1 {
+            let id = format!("ready{}", i);
+            app.request_extraction(id.clone(), "https://ex.com/x".to_string(), false, false);
+            let g = pending_generation(&app, &id);
+            app.record_extraction_result(id, g, Ok(dummy_extracted("body")));
+        }
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+
+        // Insert one more entry — eviction must skip the spawned-Pending
+        // head and instead evict the next-oldest (ready0).
+        app.request_extraction(
+            "newcomer".to_string(),
+            "https://ex.com/n".to_string(),
+            false,
+            false,
+        );
+        let g = pending_generation(&app, "newcomer");
+        app.record_extraction_result("newcomer".to_string(), g, Ok(dummy_extracted("body")));
+
+        assert!(
+            app.extracted.contains_key("spawned_head"),
+            "spawned-Pending slot must NOT be evicted — would hide it from the watchdog"
+        );
+        assert!(
+            !app.extracted.contains_key("ready0"),
+            "the next-oldest evictable entry should have been evicted instead"
+        );
+        // Size still bounded — cap +/- the one we skipped (no extra growth
+        // here because we only protected one slot and evicted one entry).
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    /// Watchdog must NOT promote a stale Pending → Failed transition to the
+    /// most-recently-used end of the LRU deque. A timed-out entry should be
+    /// strictly less useful than newer Ready entries and evicted ahead of
+    /// them — promoting it would invert that order.
+    #[test]
+    fn test_watchdog_failure_does_not_promote_lru_position() {
+        let mut app = App::new();
+        app.request_extraction(
+            "first".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // Insert another entry so we can observe LRU order before/after.
+        app.request_extraction(
+            "second".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        // Order should be [first, second] in the deque.
+        let order_before: Vec<String> = app.extracted_order.iter().cloned().collect();
+        assert_eq!(
+            order_before,
+            vec!["first".to_string(), "second".to_string()]
+        );
+
+        // Age `first` past the watchdog window and run the prune.
+        let gen = pending_generation(&app, "first");
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        app.extracted.insert(
+            "first".to_string(),
+            ExtractionState::Pending {
+                generation: gen,
+                started_at: aged,
+                spawned: true,
+            },
+        );
+        app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+
+        // State flipped to Failed, but LRU position preserved at the head.
+        assert!(matches!(
+            app.extracted.get("first"),
+            Some(ExtractionState::Failed(_))
+        ));
+        let order_after: Vec<String> = app.extracted_order.iter().cloned().collect();
+        assert_eq!(
+            order_after,
+            vec!["first".to_string(), "second".to_string()],
+            "watchdog must NOT promote a Failed entry to MRU — would let it outlive newer Ready slots"
         );
     }
 }
