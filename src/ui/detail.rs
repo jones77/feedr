@@ -131,18 +131,25 @@ pub(super) fn render_item_detail<B: Backend>(
 
         // Decide which body to render: the original summary, the extracted
         // full-text, or a placeholder for in-flight / failed extractions.
-        let body_source: BodySource =
-            match (app.selected_feed, app.selected_item, app.show_extracted) {
-                (Some(fi), Some(ii), true) => match app.extraction_state_for(fi, ii) {
-                    Some(ExtractionState::Ready(article)) => {
-                        BodySource::Extracted(article.plain_text.clone())
-                    }
-                    Some(ExtractionState::Pending) => BodySource::Extracting,
-                    Some(ExtractionState::Failed(reason)) => BodySource::Failed(reason.clone()),
-                    None => BodySource::Summary,
-                },
-                _ => BodySource::Summary,
-            };
+        // Uses `current_article_indices()` (rather than the raw selection
+        // fields) so the lookup matches the resolution logic that
+        // `toggle_or_request_fulltext` already uses — keeps the two sides
+        // in lockstep if detail rendering ever leaks out of FeedItemDetail.
+        let body_source: BodySource = if app.show_extracted {
+            match app
+                .current_article_indices()
+                .and_then(|(fi, ii)| app.extraction_state_for(fi, ii))
+            {
+                Some(ExtractionState::Ready(article)) => {
+                    BodySource::Extracted(article.plain_text.clone())
+                }
+                Some(ExtractionState::Pending) => BodySource::Extracting,
+                Some(ExtractionState::Failed(reason)) => BodySource::Failed(reason.clone()),
+                None => BodySource::Summary,
+            }
+        } else {
+            BodySource::Summary
+        };
 
         let description = match &body_source {
             BodySource::Summary => {

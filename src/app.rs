@@ -976,11 +976,7 @@ impl App {
                 // too — keeping them would never expire (no persistence)
                 // but they're keyed on item ids that no longer resolve.
                 for id in &removed_ids {
-                    if self.extracted.remove(id).is_some() {
-                        if let Some(pos) = self.extracted_order.iter().position(|x| x == id) {
-                            self.extracted_order.remove(pos);
-                        }
-                    }
+                    self.remove_extraction(id);
                 }
                 self.fulltext_feeds.remove(&url);
 
@@ -1510,7 +1506,7 @@ impl App {
     }
 
     /// Extract domain from URL (e.g., "reddit.com" from "https://www.reddit.com/r/rust/.rss")
-    fn extract_domain_from_url(url: &str) -> String {
+    pub(crate) fn extract_domain_from_url(url: &str) -> String {
         // Simple domain extraction
         if let Some(domain_start) = url.find("://") {
             let after_protocol = &url[domain_start + 3..];
@@ -1783,12 +1779,15 @@ impl App {
         }
     }
 
-    /// Insert an extraction state into the cache and bump LRU order. If the
-    /// id is already present, the existing entry is replaced and the order
-    /// entry is moved to the end. If we're at the cap, the oldest entry is
-    /// evicted.
+    /// Land a worker result for `id`. Drops the result if the slot has been
+    /// evicted, removed (feed deleted), or already taken to a non-Pending
+    /// state — we never want to resurrect a dead cache entry. The expected
+    /// predecessor is `Pending`; anything else means the result is stale.
     pub fn record_extraction_result(&mut self, id: String, result: Result<ExtractedArticle>) {
         if id.is_empty() {
+            return;
+        }
+        if !matches!(self.extracted.get(&id), Some(ExtractionState::Pending)) {
             return;
         }
         let state = match result {
@@ -1813,6 +1812,15 @@ impl App {
             .push_back(ExtractionRequest { id, url });
     }
 
+    /// Forget a single extraction slot (both the state and its LRU
+    /// position). The deque is kept in sync with the map.
+    pub(crate) fn remove_extraction(&mut self, id: &str) {
+        self.extracted.remove(id);
+        if let Some(pos) = self.extracted_order.iter().position(|x| x.as_str() == id) {
+            self.extracted_order.remove(pos);
+        }
+    }
+
     fn insert_extraction(&mut self, id: String, state: ExtractionState) {
         // If id is already present, move its LRU position to most-recent and
         // overwrite the state.
@@ -1824,23 +1832,17 @@ impl App {
             self.extracted_order.push_back(id);
             return;
         }
-        // New entry — evict oldest if we're at the cap. Skip eviction if the
-        // oldest entry is currently Pending (it has an in-flight thread that
-        // will try to write back).
+        // Hard cap: evict the oldest entry unconditionally. If that entry
+        // happens to be `Pending`, the worker's eventual write-back will be
+        // dropped by `record_extraction_result`'s staleness check — so we
+        // never grow past EXTRACTED_CACHE_CAP, and we never resurrect an
+        // evicted slot.
         while self.extracted_order.len() >= EXTRACTED_CACHE_CAP {
-            let evict = match self.extracted_order.front() {
-                Some(front) => front.clone(),
+            match self.extracted_order.pop_front() {
+                Some(evict) => {
+                    self.extracted.remove(&evict);
+                }
                 None => break,
-            };
-            let is_pending = matches!(self.extracted.get(&evict), Some(ExtractionState::Pending));
-            self.extracted_order.pop_front();
-            if !is_pending {
-                self.extracted.remove(&evict);
-            } else {
-                // Pending entry — re-insert at the back so we don't busy-loop
-                // evicting it. The eventual write-back will land normally.
-                self.extracted_order.push_back(evict);
-                break;
             }
         }
         self.extracted.insert(id.clone(), state);
@@ -1873,25 +1875,36 @@ impl App {
                 return;
             }
         };
+        // Track whether this invocation actually queued / unqueued a
+        // request so we only show the off-view hint when something happened.
+        let mut queued_or_toggled = false;
         match self.extracted.get(&id) {
             Some(ExtractionState::Ready(_)) => {
                 self.show_extracted = !self.show_extracted;
+                queued_or_toggled = true;
             }
             Some(ExtractionState::Pending) => {
                 // already in flight — leave it
             }
             Some(ExtractionState::Failed(_)) => {
-                self.extracted.remove(&id);
-                if let Some(pos) = self.extracted_order.iter().position(|x| x == &id) {
-                    self.extracted_order.remove(pos);
-                }
+                self.remove_extraction(&id);
                 self.show_extracted = true;
                 self.request_extraction(id, url);
+                queued_or_toggled = true;
             }
             None => {
                 self.show_extracted = true;
                 self.request_extraction(id, url);
+                queued_or_toggled = true;
             }
+        }
+        // The detail view is what renders extracted state; when the action
+        // fires from anywhere else (macro path on Dashboard / FeedItems /
+        // Starred) the user gets no visible feedback. Surface a hint so the
+        // request doesn't feel like a no-op.
+        if queued_or_toggled && self.view != View::FeedItemDetail {
+            self.success_message = Some("Extracting full text (open article to view)".to_string());
+            self.success_message_time = Some(std::time::Instant::now());
         }
     }
 }
@@ -2842,9 +2855,13 @@ mod tests {
     #[test]
     fn test_lru_evicts_oldest_at_cap() {
         let mut app = App::new();
-        // Insert one more than the cap; the first id must be evicted.
+        // Insert one more than the cap; the first id must be evicted. Real
+        // callers always Pending → Ready, and `record_extraction_result`
+        // refuses results for slots without a Pending predecessor, so do the
+        // same here.
         for i in 0..EXTRACTED_CACHE_CAP + 1 {
             let id = format!("id{}", i);
+            app.request_extraction(id.clone(), "https://ex.com/a".to_string());
             app.record_extraction_result(id, Ok(dummy_extracted("x")));
         }
         assert!(!app.extracted.contains_key("id0"), "oldest must be evicted");
@@ -2854,10 +2871,13 @@ mod tests {
     #[test]
     fn test_remove_current_feed_prunes_extracted_cache() {
         let mut app = make_test_app();
-        // Seed extraction state for items in the first feed.
+        // Seed extraction state for items in the first feed via the real
+        // request → result transition.
         let id_old = app.get_item_id(0, 0);
         let id_new = app.get_item_id(0, 1);
+        app.request_extraction(id_old.clone(), "https://ex.com/a".to_string());
         app.record_extraction_result(id_old.clone(), Ok(dummy_extracted("a")));
+        app.request_extraction(id_new.clone(), "https://ex.com/b".to_string());
         app.record_extraction_result(id_new.clone(), Ok(dummy_extracted("b")));
         assert_eq!(app.extracted.len(), 2);
 
@@ -2873,5 +2893,65 @@ mod tests {
             app.extracted_order.is_empty(),
             "LRU order must be pruned in sync with the map"
         );
+    }
+
+    #[test]
+    fn test_record_extraction_result_drops_late_result_for_evicted_id() {
+        // Simulates the race where a worker thread completes after its slot
+        // was evicted (or its feed was removed). We must not resurrect the
+        // slot — otherwise dead state pins memory and confuses the UI.
+        let mut app = App::new();
+        app.record_extraction_result("ghost".to_string(), Ok(dummy_extracted("body")));
+        assert!(
+            !app.extracted.contains_key("ghost"),
+            "result for an id with no Pending slot must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_record_extraction_result_drops_late_result_for_ready_slot() {
+        // If the slot is already `Ready` (e.g. user manually retried and the
+        // retry landed first), a second late worker must not clobber it.
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("first")));
+        // Late second worker — slot is Ready, so this must be a no-op.
+        app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("late")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => {
+                assert_eq!(a.plain_text, "first", "late result must not clobber Ready")
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lru_hard_cap_when_oldest_is_pending() {
+        // Stress the soft-cap edge case: queue CAP+1 requests as Pending
+        // (no result returned). The cache size must stay at the cap, not
+        // grow with the number of in-flight requests.
+        let mut app = App::new();
+        for i in 0..EXTRACTED_CACHE_CAP + 5 {
+            let id = format!("id{}", i);
+            app.request_extraction(id, "https://ex.com/a".to_string());
+        }
+        assert_eq!(
+            app.extracted.len(),
+            EXTRACTED_CACHE_CAP,
+            "Pending entries must not let the cache exceed the hard cap"
+        );
+        assert_eq!(app.extracted_order.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    #[test]
+    fn test_remove_extraction_helper_prunes_both_map_and_order() {
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("body")));
+        assert_eq!(app.extracted.len(), 1);
+        assert_eq!(app.extracted_order.len(), 1);
+        app.remove_extraction("id1");
+        assert!(app.extracted.is_empty());
+        assert!(app.extracted_order.is_empty());
     }
 }

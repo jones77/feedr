@@ -605,6 +605,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "dom_smoothie",
+ "encoding_rs",
  "feed-rs",
  "html2text",
  "open",

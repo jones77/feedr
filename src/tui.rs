@@ -13,9 +13,18 @@ use ratatui::{
     Terminal,
 };
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::{io, time::Duration};
+
+/// Hard cap on extraction worker threads in flight. The previous code spawned
+/// one thread per queued request unconditionally, which fanned out as 20+
+/// concurrent HTTP requests on a refresh of several `fulltext = true` feeds —
+/// often to the same host. A small pool plus per-domain throttling matches
+/// the politeness budget the feed-refresh path already uses.
+const EXTRACTION_MAX_INFLIGHT: usize = 4;
 
 /// RAII guard that re-enters the alt-screen + raw mode + mouse capture on drop,
 /// so a panic during a pipe-to child invocation cannot leave the terminal in
@@ -235,6 +244,12 @@ fn collect_exec_on_new(app: &App, feed: &Feed, newly_seen: &[usize]) -> Vec<Vec<
 /// item is only auto-extracted once (and not on the first ever fetch of a
 /// feed — that one seeds the seen-set silently, matching the exec_on_new
 /// no-firehose contract).
+///
+/// Auto-mode applies a scheme + private-IP allowlist (`is_safe_auto_url`):
+/// the URL comes from feed XML, which a hostile feed could populate with
+/// `http://169.254.169.254/...` or other internal targets to trick the
+/// reader into probing the local network. Manual `Shift+F` is the user's
+/// explicit action and bypasses this gate.
 fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
     if !app.fulltext_feeds.contains(&feed.url) {
         return;
@@ -246,6 +261,9 @@ fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
         let Some(url) = item.link.as_deref() else {
             continue;
         };
+        if !crate::feed::is_safe_auto_url(url) {
+            continue;
+        }
         let id = crate::app::make_item_id(feed, item);
         app.request_extraction(id, url.to_string());
     }
@@ -305,11 +323,24 @@ fn spawn_feed_refresh(app: &mut App) -> (usize, mpsc::Receiver<(usize, Result<Fe
     (pending_count, feed_rx)
 }
 
-/// Spawn worker threads for any extraction requests queued on the app.
-/// Each worker fetches the article URL with the existing reqwest blocking
-/// client, runs Readability, and posts the result back through `tx`. Per-feed
-/// auth headers are deliberately omitted (article URLs are third-party hosts).
-fn spawn_pending_extractions(app: &mut App, tx: &mpsc::Sender<(String, Result<ExtractedArticle>)>) {
+/// Drain pending extraction requests up to the concurrency budget, applying
+/// per-domain throttling that matches the existing feed-refresh policy.
+/// Each spawned worker:
+///   * fetches the article URL with the existing reqwest blocking client
+///     (no per-feed auth headers — see `extract_article`)
+///   * runs Readability and posts the result back through `tx`
+///   * catches panics from `dom_smoothie` on hostile HTML and surfaces them
+///     as a `Failed` result so the slot doesn't strand on `Pending` forever
+///   * decrements `inflight` regardless of success / failure / panic, so the
+///     pool can't deadlock when a worker dies
+///
+/// Requests deferred for throttling or budget reasons stay on the queue;
+/// `run_app` calls this every loop iteration so they fire on the next tick.
+fn spawn_pending_extractions(
+    app: &mut App,
+    tx: &mpsc::Sender<(String, Result<ExtractedArticle>)>,
+    inflight: &Arc<AtomicUsize>,
+) {
     if app.pending_extraction_requests.is_empty() {
         return;
     }
@@ -319,14 +350,67 @@ fn spawn_pending_extractions(app: &mut App, tx: &mpsc::Sender<(String, Result<Ex
         Ok(c) => c,
         Err(_) => return,
     };
-    while let Some(req) = app.pending_extraction_requests.pop_front() {
+    let rate_limit = Duration::from_millis(app.config.general.refresh_rate_limit_delay);
+    let now = std::time::Instant::now();
+
+    // Pop only as many as the concurrency budget AND per-domain spacing
+    // allow. Anything we can't run right now gets pushed back to the front
+    // in original order so it retries next tick.
+    let mut deferred: Vec<crate::app::ExtractionRequest> = Vec::new();
+    loop {
+        let in_use = inflight.load(Ordering::SeqCst);
+        if in_use >= EXTRACTION_MAX_INFLIGHT {
+            break;
+        }
+        let Some(req) = app.pending_extraction_requests.pop_front() else {
+            break;
+        };
+        let domain = App::extract_domain_from_url(&req.url);
+        let too_soon = !rate_limit.is_zero()
+            && app
+                .last_domain_fetch
+                .get(&domain)
+                .map(|last| now.duration_since(*last) < rate_limit)
+                .unwrap_or(false);
+        if too_soon {
+            deferred.push(req);
+            continue;
+        }
+        // Claim the budget slot and stamp the domain BEFORE spawning so a
+        // concurrent caller (or the very next loop iteration) sees the slot
+        // taken / the domain freshly used.
+        inflight.fetch_add(1, Ordering::SeqCst);
+        if !domain.is_empty() {
+            app.last_domain_fetch.insert(domain, now);
+        }
         let client = client.clone();
         let ua = user_agent.clone();
         let tx = tx.clone();
+        let inflight = Arc::clone(inflight);
+        let req_id = req.id.clone();
+        let req_url = req.url.clone();
         std::thread::spawn(move || {
-            let result = crate::feed::extract_article(&req.url, &client, Some(&ua));
-            let _ = tx.send((req.id, result));
+            // `extract_article` and (via dom_smoothie) Readability touch
+            // arbitrary HTML; a panic from the worker would otherwise leave
+            // the slot stuck on `Pending` for the rest of the session and
+            // there'd be no way for the user to retry.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                crate::feed::extract_article(&req_url, &client, Some(&ua))
+            }));
+            let result = match outcome {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "extraction worker panicked (hostile HTML?)"
+                )),
+            };
+            let _ = tx.send((req_id, result));
+            inflight.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+    // Re-enqueue throttled requests at the front, preserving their original
+    // FIFO order. Without `.rev()` we'd flip them.
+    for req in deferred.into_iter().rev() {
+        app.pending_extraction_requests.push_front(req);
     }
 }
 
@@ -338,6 +422,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
     // Long-lived channel for extraction worker completions. Outlives any
     // individual refresh because manual `F` extractions can fire at any time.
     let (extract_tx, extract_rx) = mpsc::channel::<(String, Result<ExtractedArticle>)>();
+    // Bounds concurrent extraction workers. Each spawned worker bumps this
+    // on entry and drops it on exit (even on panic), so the pool never
+    // deadlocks even if `dom_smoothie` blows up on hostile HTML.
+    let extract_inflight = Arc::new(AtomicUsize::new(0));
 
     // Initial load of bookmarked feeds
     let (mut pending_count, mut feed_rx) = spawn_feed_refresh(app);
@@ -444,7 +532,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Spawn workers for any extraction requests queued by events or
         // by the feed-refresh path above. Run every iteration so manual
         // `F` requests don't have to wait for a tick boundary.
-        spawn_pending_extractions(app, &extract_tx);
+        spawn_pending_extractions(app, &extract_tx, &extract_inflight);
 
         // Drain completed extractions back into app state. This is what
         // flips a `Pending` entry to `Ready` / `Failed`, which the detail
