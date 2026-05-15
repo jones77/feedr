@@ -26,6 +26,20 @@ use std::{io, time::Duration};
 /// the politeness budget the feed-refresh path already uses.
 const EXTRACTION_MAX_INFLIGHT: usize = 4;
 
+/// Saturating decrement of the inflight counter — used by BOTH the worker's
+/// exit path and the watchdog. The watchdog releases a slot for any Pending
+/// it flips to `Failed("timed out")` so a truly dead worker can't leak
+/// budget for the rest of the session. If both paths fire for the same
+/// slot (slow worker the watchdog wrote off, then completed anyway), the
+/// saturating sub clamps at zero instead of underflowing to usize::MAX —
+/// which would effectively turn the bound into "spawn as many workers as
+/// you want until the heap runs out".
+fn release_inflight_slot(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+        Some(x.saturating_sub(1))
+    });
+}
+
 /// RAII guard that re-enters the alt-screen + raw mode + mouse capture on drop,
 /// so a panic during a pipe-to child invocation cannot leave the terminal in
 /// a broken state.
@@ -463,10 +477,10 @@ fn spawn_pending_extractions(
                 )),
             };
             let _ = tx.send((req_id, req_generation, result));
-            inflight_for_worker.fetch_sub(1, Ordering::Relaxed);
+            release_inflight_slot(&inflight_for_worker);
         });
         if spawn_result.is_err() {
-            inflight.fetch_sub(1, Ordering::Relaxed);
+            release_inflight_slot(inflight);
             app.pending_extraction_requests.push_front(req);
             break;
         }
@@ -630,8 +644,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Watchdog: flip any Pending slot older than `http_timeout * N` to
         // `Failed("timed out")`. Cheap (cache cap is 500); covers the rare
         // case where a worker thread is killed externally (OOM, signal,
-        // SIGSEGV in a native dep) and never sends its result.
-        app.prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
+        // SIGSEGV in a native dep) and never sends its result. Release one
+        // inflight slot per pruned Pending so a chain of dead workers can't
+        // permanently saturate the pool. The matching saturating sub in the
+        // worker's exit path makes a spurious wake-up (worker actually still
+        // alive, finishes later) safe — at worst we transiently overcommit
+        // by one slot, never underflow.
+        let pruned = app
+            .prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
+        for _ in 0..pruned {
+            release_inflight_slot(&extract_inflight);
+        }
 
         if event::poll(timeout)? {
             // Handle user input
@@ -738,6 +761,71 @@ mod tests {
         assert!(app.pending_macro_steps.is_empty());
         assert!(app.error.is_none());
         assert!(app.show_help_overlay);
+    }
+
+    #[test]
+    fn test_release_inflight_slot_saturates_at_zero() {
+        // The watchdog and worker-exit paths can race for the same slot.
+        // The saturating decrement must clamp at zero rather than wrapping
+        // to usize::MAX — otherwise the inflight bound is meaningless and
+        // the pool would spawn workers without limit.
+        let counter = AtomicUsize::new(0);
+        release_inflight_slot(&counter);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_release_inflight_slot_decrements_above_zero() {
+        let counter = AtomicUsize::new(3);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        release_inflight_slot(&counter);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        // One more — must still clamp.
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_prune_returns_count_so_caller_can_release_inflight() {
+        // Regression test for the inflight-leak fix: the watchdog must report
+        // how many slots it pruned so `run_app` can release that many inflight
+        // budget slots. Without the count, a chain of dead workers would
+        // saturate the pool for the rest of the session.
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        app.request_extraction(
+            "stuck1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        app.request_extraction(
+            "stuck2".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        // Forcibly age both Pending slots past the watchdog window.
+        let aged = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        for id in ["stuck1", "stuck2"] {
+            if let Some(ExtractionState::Pending { generation, .. }) = app.extracted.get(id) {
+                let gen = *generation;
+                app.extracted.insert(
+                    id.to_string(),
+                    ExtractionState::Pending {
+                        generation: gen,
+                        started_at: aged,
+                    },
+                );
+            }
+        }
+        let pruned = app.prune_stale_pending_extractions(Duration::from_secs(30));
+        assert_eq!(pruned, 2, "watchdog must report the slot count");
     }
 
     #[test]

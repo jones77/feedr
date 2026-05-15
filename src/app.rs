@@ -158,6 +158,14 @@ pub struct App {
     /// summary. Single global toggle (not per-item) — simplest UX and the
     /// detail view only ever shows one article at a time.
     pub show_extracted: bool,
+    /// `(feed_idx, item_idx)` of the article the detail view rendered last
+    /// frame. When the focus moves to a different article, `show_extracted`
+    /// is reset to `true` so the user doesn't carry over a "view summary"
+    /// toggle from one article to another (and end up staring at a summary
+    /// while the title bar labels the body `Full-text`). Only the detail
+    /// view writes to / consults this — other views resolve focus through
+    /// `current_article_indices` directly.
+    pub last_detail_focus: Option<(usize, usize)>,
     /// Queue of extraction requests for the TUI loop to spawn worker threads
     /// for. Decouples request-time (event handler) from spawn-time (loop
     /// drain) so events.rs doesn't need the thread-handle / channel.
@@ -439,6 +447,7 @@ impl App {
             extracted_order: VecDeque::new(),
             fulltext_feeds,
             show_extracted: true,
+            last_detail_focus: None,
             pending_extraction_requests: VecDeque::new(),
             next_extraction_generation: 0,
         };
@@ -1883,21 +1892,24 @@ impl App {
     }
 
     /// Sweep Pending slots that have been in-flight longer than
-    /// `http_timeout * PENDING_WATCHDOG_MULTIPLIER`. A normally-completing
-    /// worker (success, error, even a Rust panic caught by `catch_unwind`)
-    /// always sends a result back through the channel. A worker that
-    /// silently disappears — OS kill, SIGSEGV in a native dep, the parent
-    /// thread crashing — leaves its slot stuck on Pending forever, which
-    /// blocks the user from re-requesting via `toggle_or_request_fulltext`'s
-    /// `contains_key` guard. Flipping to `Failed("timed out")` lets the
-    /// user retry. The corresponding `inflight` slot is intentionally NOT
-    /// decremented: if the worker is actually still alive and eventually
-    /// exits normally, its own `fetch_sub` will run; we'd otherwise
-    /// double-decrement and underflow the counter.
-    pub fn prune_stale_pending_extractions(&mut self, http_timeout: std::time::Duration) {
+    /// `http_timeout * PENDING_WATCHDOG_MULTIPLIER`, flip them to
+    /// `Failed("timed out")`, and return the count so the caller can release
+    /// the corresponding inflight budget slots.
+    ///
+    /// A normally-completing worker (success, error, even a Rust panic caught
+    /// by `catch_unwind`) always sends a result back through the channel. A
+    /// worker that silently disappears — OS kill, SIGSEGV in a native dep,
+    /// parent thread crash — leaves its slot stuck on Pending forever, which
+    /// blocks `toggle_or_request_fulltext`'s `contains_key` guard. The
+    /// returned count is what `run_app` passes to a saturating decrement of
+    /// the shared `extract_inflight` counter so the pool doesn't leak budget
+    /// slots across a session. Both the watchdog path and the worker-exit
+    /// path use saturating decrement, so a slow worker that completes AFTER
+    /// the watchdog already released its slot can't underflow the counter.
+    pub fn prune_stale_pending_extractions(&mut self, http_timeout: std::time::Duration) -> usize {
         let watchdog = http_timeout.saturating_mul(PENDING_WATCHDOG_MULTIPLIER);
         if watchdog.is_zero() {
-            return;
+            return 0;
         }
         let now = Instant::now();
         let mut to_fail: Vec<String> = Vec::new();
@@ -1908,9 +1920,11 @@ impl App {
                 }
             }
         }
+        let count = to_fail.len();
         for id in to_fail {
             self.insert_extraction(id, ExtractionState::Failed("timed out".to_string()));
         }
+        count
     }
 
     /// Forget a single extraction slot (both the state and its LRU
@@ -2009,6 +2023,18 @@ impl App {
         if queued_or_toggled && self.view != View::FeedItemDetail {
             self.success_message = Some("Extracting full text (open article to view)".to_string());
             self.success_message_time = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Called from the detail renderer each frame. If the focused article
+    /// changed since the last frame, reset the global `show_extracted`
+    /// toggle to `true` so the user doesn't carry a "view summary" choice
+    /// from one article to another. Idempotent on unchanged focus.
+    pub fn sync_detail_focus_anchor(&mut self) {
+        let current_focus = self.current_article_indices();
+        if self.last_detail_focus != current_focus {
+            self.show_extracted = true;
+            self.last_detail_focus = current_focus;
         }
     }
 }
@@ -3266,5 +3292,59 @@ mod tests {
         app.remove_extraction("id1");
         assert!(app.extracted.is_empty());
         assert!(app.extracted_order.is_empty());
+    }
+
+    #[test]
+    fn test_sync_detail_focus_anchor_resets_show_extracted_on_focus_change() {
+        // Regression test for the cross-article show_extracted bug: the
+        // global toggle must reset to `true` whenever the detail view's
+        // focused article changes, so a "view summary" choice on article A
+        // doesn't silently carry over to article B.
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        // First sync — establishes the anchor at (0, 0).
+        app.sync_detail_focus_anchor();
+        assert!(app.show_extracted);
+        assert_eq!(app.last_detail_focus, Some((0, 0)));
+
+        // Simulate the user pressing Shift+F to toggle off on article (0, 0).
+        app.show_extracted = false;
+        // Re-sync on the same article — must NOT clobber the user's toggle.
+        app.sync_detail_focus_anchor();
+        assert!(
+            !app.show_extracted,
+            "anchor unchanged → user's toggle preserved"
+        );
+
+        // User navigates to article (0, 1). Sync must reset the toggle.
+        app.selected_item = Some(1);
+        app.sync_detail_focus_anchor();
+        assert!(
+            app.show_extracted,
+            "focus changed → show_extracted must reset to true"
+        );
+        assert_eq!(app.last_detail_focus, Some((0, 1)));
+    }
+
+    #[test]
+    fn test_sync_detail_focus_anchor_is_noop_when_focus_unchanged() {
+        // Per-frame call must be idempotent — otherwise a toggled-off state
+        // would be wiped on the very next frame and the toggle would feel
+        // unresponsive.
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        app.sync_detail_focus_anchor();
+        app.show_extracted = false;
+        for _ in 0..10 {
+            app.sync_detail_focus_anchor();
+        }
+        assert!(
+            !app.show_extracted,
+            "repeated syncs must not wipe the toggle"
+        );
     }
 }

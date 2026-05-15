@@ -30,6 +30,11 @@ pub(super) fn render_item_detail<B: Backend>(
     area: Rect,
     colors: &ColorScheme,
 ) {
+    // Reset the `show_extracted` toggle on article focus change. Done at
+    // the top so we hold no immutable borrow on `app` (the `current_item`
+    // call below would conflict). Logic lives on `App` so it's
+    // unit-testable without spinning up a TestBackend.
+    app.sync_detail_focus_anchor();
     if let Some(item) = app.current_item() {
         // Split the area into header and content with better proportions
         let chunks = Layout::default()

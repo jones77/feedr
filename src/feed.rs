@@ -178,6 +178,9 @@ fn is_global_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                // Multicast 224.0.0.0/4 — IPv6 multicast (ff00::/8) is
+                // already rejected below; this closes the v4/v6 asymmetry.
+                || v4.is_multicast()
                 || v4.octets()[0] == 0
                 // CGNAT 100.64.0.0/10
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
@@ -1156,6 +1159,9 @@ mod tests {
         assert!(!is_safe_auto_url("http://[fe80::1]/x"));
         // IPv6 deprecated site-local fec0::/10
         assert!(!is_safe_auto_url("http://[fec0::1]/x"));
+        // IPv4 multicast 224.0.0.0/4 — parity with IPv6 multicast below.
+        assert!(!is_safe_auto_url("http://224.0.0.1/x"));
+        assert!(!is_safe_auto_url("http://239.255.255.250/x"));
         // IPv6 multicast ff00::/8
         assert!(!is_safe_auto_url("http://[ff02::1]/x"));
         // 6to4 wrapping link-local — would route via 6to4 relay to
