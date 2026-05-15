@@ -1,6 +1,6 @@
 use crate::app::{App, View};
 use crate::events::handle_events;
-use crate::feed::Feed;
+use crate::feed::{ExtractedArticle, Feed};
 use crate::ui;
 use anyhow::{Context, Result};
 use crossterm::{
@@ -201,36 +201,54 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
     }
 }
 
-/// Diff a freshly-arrived feed against `app.seen_items`, mutate the seen
-/// state in memory, and return the argv list to spawn for each genuinely-new
-/// item. On the first successful fetch of a feed (URL not yet in
-/// `feeds_seeded`), seed the seen set silently and return an empty list.
+/// Build the argv list to spawn for each genuinely-new item on this feed.
+/// `newly_seen` must come from `mark_feed_seen` — this helper consumes the
+/// pre-computed indices so multiple consumers (exec_on_new + fulltext) can
+/// share one `mark_feed_seen` call per feed arrival instead of double-marking.
 ///
 /// Returns Vec rather than spawning + saving inline so a refresh batch can
 /// `save_data` ONCE before spawning ANY child, instead of once per feed
 /// arrival (write amplification of N for N bookmarks). Crash semantics still
 /// AT-MOST-ONCE: see [`flush_exec_on_new`] for the persistence ordering.
 ///
-/// No-op when the hook is not configured. seen_items / feeds_seeded only
-/// exist to drive this hook, so users who never opt in pay neither the
-/// memory cost nor any save_data round-trip.
-fn collect_exec_on_new(app: &mut App, feed: &Feed) -> Vec<Vec<String>> {
+/// No-op when the hook is not configured.
+fn collect_exec_on_new(app: &App, feed: &Feed, newly_seen: &[usize]) -> Vec<Vec<String>> {
     let argv_template = match app.exec_on_new_template.as_ref() {
         Some(t) => t.clone(),
         None => return Vec::new(),
     };
-    let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
-    if newly_seen_idx.is_empty() {
+    if newly_seen.is_empty() {
         return Vec::new();
     }
-    newly_seen_idx
-        .into_iter()
-        .filter_map(|idx| {
+    newly_seen
+        .iter()
+        .filter_map(|&idx| {
             let item = feed.items.get(idx)?;
             let ctx = crate::app::article_context_from(feed, item);
             Some(crate::app::expand_argv_template(&argv_template, &ctx))
         })
         .collect()
+}
+
+/// For feeds with `fulltext = true`, queue an extraction request for each
+/// newly-seen item. Uses the same newly-seen set as `exec_on_new` so an
+/// item is only auto-extracted once (and not on the first ever fetch of a
+/// feed — that one seeds the seen-set silently, matching the exec_on_new
+/// no-firehose contract).
+fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
+    if !app.fulltext_feeds.contains(&feed.url) {
+        return;
+    }
+    for &idx in newly_seen {
+        let Some(item) = feed.items.get(idx) else {
+            continue;
+        };
+        let Some(url) = item.link.as_deref() else {
+            continue;
+        };
+        let id = crate::app::make_item_id(feed, item);
+        app.request_extraction(id, url.to_string());
+    }
 }
 
 /// Persist the updated seen-set, then spawn all collected exec_on_new
@@ -287,10 +305,39 @@ fn spawn_feed_refresh(app: &mut App) -> (usize, mpsc::Receiver<(usize, Result<Fe
     (pending_count, feed_rx)
 }
 
+/// Spawn worker threads for any extraction requests queued on the app.
+/// Each worker fetches the article URL with the existing reqwest blocking
+/// client, runs Readability, and posts the result back through `tx`. Per-feed
+/// auth headers are deliberately omitted (article URLs are third-party hosts).
+fn spawn_pending_extractions(app: &mut App, tx: &mpsc::Sender<(String, Result<ExtractedArticle>)>) {
+    if app.pending_extraction_requests.is_empty() {
+        return;
+    }
+    let timeout = app.config.network.http_timeout;
+    let user_agent = app.config.network.user_agent.clone();
+    let client = match Feed::build_client(timeout) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    while let Some(req) = app.pending_extraction_requests.pop_front() {
+        let client = client.clone();
+        let ua = user_agent.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::feed::extract_article(&req.url, &client, Some(&ua));
+            let _ = tx.send((req.id, result));
+        });
+    }
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = Duration::from_millis(app.config.ui.tick_rate);
     let error_timeout = Duration::from_millis(app.config.ui.error_display_timeout);
+
+    // Long-lived channel for extraction worker completions. Outlives any
+    // individual refresh because manual `F` extractions can fire at any time.
+    let (extract_tx, extract_rx) = mpsc::channel::<(String, Result<ExtractedArticle>)>();
 
     // Initial load of bookmarked feeds
     let (mut pending_count, mut feed_rx) = spawn_feed_refresh(app);
@@ -323,7 +370,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             let mut pending_exec: Vec<Vec<String>> = Vec::new();
             while let Ok((idx, result)) = feed_rx.try_recv() {
                 if let Ok(feed) = result {
-                    pending_exec.extend(collect_exec_on_new(app, &feed));
+                    // Compute newly-seen ONCE per feed arrival, shared
+                    // between exec_on_new and fulltext consumers. Skip the
+                    // mark entirely when neither consumer needs it — keeps
+                    // `seen_items` empty for users without hooks, matching
+                    // the original zero-cost contract.
+                    let needs_newly_seen = app.exec_on_new_template.is_some()
+                        || app.fulltext_feeds.contains(&feed.url);
+                    let newly_seen = if needs_newly_seen {
+                        crate::app::mark_feed_seen(app, &feed)
+                    } else {
+                        Vec::new()
+                    };
+                    pending_exec.extend(collect_exec_on_new(app, &feed, &newly_seen));
+                    enqueue_fulltext_for_new(app, &feed, &newly_seen);
                     // Insert at the correct position to maintain bookmark order,
                     // or append if earlier feeds haven't arrived yet
                     let insert_pos = app
@@ -380,6 +440,18 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         } else {
             tick_rate
         };
+
+        // Spawn workers for any extraction requests queued by events or
+        // by the feed-refresh path above. Run every iteration so manual
+        // `F` requests don't have to wait for a tick boundary.
+        spawn_pending_extractions(app, &extract_tx);
+
+        // Drain completed extractions back into app state. This is what
+        // flips a `Pending` entry to `Ready` / `Failed`, which the detail
+        // view reads from on the next draw.
+        while let Ok((id, result)) = extract_rx.try_recv() {
+            app.record_extraction_result(id, result);
+        }
 
         if event::poll(timeout)? {
             // Handle user input
@@ -486,6 +558,28 @@ mod tests {
         assert!(app.pending_macro_steps.is_empty());
         assert!(app.error.is_none());
         assert!(app.show_help_overlay);
+    }
+
+    #[test]
+    fn test_record_extraction_result_flips_pending_to_ready() {
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        // simulate a worker thread completing successfully
+        app.record_extraction_result(
+            "id1".to_string(),
+            Ok(ExtractedArticle {
+                title: "T".to_string(),
+                plain_text: "body".to_string(),
+                byline: None,
+                site_name: None,
+                source_url: "https://ex.com/a".to_string(),
+            }),
+        );
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
+            other => panic!("expected Ready, got {:?}", other),
+        }
     }
 
     #[test]

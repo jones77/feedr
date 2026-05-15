@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use dom_smoothie::{Config as ReadabilityConfig, Readability};
 use feed_rs::parser;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,16 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
+
+/// Cap on response body size for article extraction. Anything larger is
+/// almost certainly not a typical article page and would only burn CPU in
+/// the Readability DOM walker.
+const FULLTEXT_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Minimum text length the extracted article body must contain to be
+/// considered useful. Pages below this are treated as "page appears empty"
+/// — usually JS-rendered shells, login walls, or 404 placeholders.
+const FULLTEXT_MIN_LENGTH: usize = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Feed {
@@ -98,6 +109,112 @@ pub struct DiscoveredFeed {
     pub url: String,
     pub title: String,
     pub feed_type: FeedType,
+}
+
+/// Outcome of a successful Readability extraction against an article URL.
+/// Decoupled from `dom_smoothie::Article` so the upstream crate can be
+/// swapped without rippling through the rest of the codebase.
+#[derive(Clone, Debug)]
+pub struct ExtractedArticle {
+    pub title: String,
+    pub plain_text: String,
+    pub byline: Option<String>,
+    pub site_name: Option<String>,
+    pub source_url: String,
+}
+
+/// Fetch `url` with `client` and run Mozilla-Readability extraction over the
+/// returned HTML. Feed auth headers are intentionally NOT propagated: the
+/// article URL is on a different host and may be third-party, so leaking
+/// per-feed `Authorization` headers would be a credential leak.
+///
+/// Rejects non-`text/html` responses, oversized bodies (`FULLTEXT_MAX_BYTES`),
+/// and pages whose extracted text falls below `FULLTEXT_MIN_LENGTH` (treated
+/// as JS-rendered or empty).
+pub fn extract_article(
+    url: &str,
+    client: &reqwest::blocking::Client,
+    user_agent: Option<&str>,
+) -> Result<ExtractedArticle> {
+    let default_user_agent =
+        "Mozilla/5.0 (compatible; Feedr/1.0; +https://github.com/bahdotsh/feedr)";
+    let ua = user_agent.unwrap_or(default_user_agent);
+
+    let response = client
+        .get(url)
+        .header("User-Agent", ua)
+        .header("Accept", "text/html, application/xhtml+xml, */*;q=0.5")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "gzip, deflate")
+        .send()
+        .context("Failed to fetch article")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "HTTP error {} fetching article from {}",
+            status,
+            url
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|ct| ct.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if !content_type.is_empty()
+        && !content_type.contains("text/html")
+        && !content_type.contains("application/xhtml")
+    {
+        return Err(anyhow::anyhow!(
+            "Article URL did not return HTML (content-type: {})",
+            content_type
+        ));
+    }
+
+    let final_url = response.url().to_string();
+    let bytes = response.bytes().context("Failed to read article body")?;
+    if bytes.len() > FULLTEXT_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "Article body too large ({} bytes, cap {} bytes)",
+            bytes.len(),
+            FULLTEXT_MAX_BYTES
+        ));
+    }
+
+    let html = String::from_utf8_lossy(&bytes).into_owned();
+    extract_from_html(&html, &final_url)
+}
+
+/// Pure Readability step — no I/O. Split out so unit tests can exercise the
+/// extraction + min-length + error-path logic without a network round-trip.
+pub fn extract_from_html(html: &str, source_url: &str) -> Result<ExtractedArticle> {
+    let cfg = ReadabilityConfig {
+        max_elements_to_parse: 9000,
+        ..ReadabilityConfig::default()
+    };
+    let mut readability = Readability::new(html, Some(source_url), Some(cfg))
+        .context("Failed to initialize Readability")?;
+    let article = readability
+        .parse()
+        .context("Readability could not parse article")?;
+
+    if article.length < FULLTEXT_MIN_LENGTH {
+        return Err(anyhow::anyhow!(
+            "Page appears empty (only {} chars of body) — likely JS-rendered or paywalled",
+            article.length
+        ));
+    }
+
+    Ok(ExtractedArticle {
+        title: article.title,
+        plain_text: article.text_content.to_string(),
+        byline: article.byline,
+        site_name: article.site_name,
+        source_url: source_url.to_string(),
+    })
 }
 
 /// Result of fetching a URL that was expected to be a feed.
@@ -547,5 +664,72 @@ mod tests {
         };
         let err = result.into_feed().unwrap_err();
         assert!(err.to_string().contains("No RSS/Atom feed links found"));
+    }
+
+    /// A blog-post-shaped fixture long enough to clear FULLTEXT_MIN_LENGTH
+    /// once Readability strips boilerplate.
+    fn fixture_article_html() -> String {
+        let body = "Feedr is a terminal-based RSS feed reader. It supports \
+            categories, OPML import, and a configurable keybinding system. \
+            This paragraph is repeated several times to ensure the extracted \
+            text content comfortably exceeds the minimum-length threshold \
+            that the extractor enforces before declaring the page empty. ";
+        let mut content = String::new();
+        for _ in 0..5 {
+            content.push_str("<p>");
+            content.push_str(body);
+            content.push_str("</p>");
+        }
+        format!(
+            r#"<!doctype html><html><head>
+                <title>About Feedr</title>
+                <meta name="author" content="Test Author">
+            </head><body>
+                <nav>Home About Contact</nav>
+                <article>
+                    <h1>About Feedr</h1>
+                    {}
+                </article>
+                <footer>Copyright 2026</footer>
+            </body></html>"#,
+            content
+        )
+    }
+
+    #[test]
+    fn test_extract_from_html_succeeds_on_blog_shaped_page() {
+        let html = fixture_article_html();
+        let article = extract_from_html(&html, "https://example.com/post").unwrap();
+        assert!(!article.title.is_empty(), "title should be extracted");
+        assert!(
+            article.plain_text.len() >= FULLTEXT_MIN_LENGTH,
+            "extracted text below minimum: {}",
+            article.plain_text.len()
+        );
+        assert_eq!(article.source_url, "https://example.com/post");
+    }
+
+    #[test]
+    fn test_extract_from_html_rejects_short_content() {
+        let html = r#"<!doctype html><html><body><p>tiny.</p></body></html>"#;
+        let err = extract_from_html(html, "https://example.com/empty").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("empty"),
+            "expected 'empty' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_extract_from_html_rejects_bad_document_url() {
+        let html = fixture_article_html();
+        let err = extract_from_html(&html, "not-a-url").unwrap_err();
+        let msg = format!("{:?}", err);
+        // dom_smoothie's BadDocumentURL wrapped by our context string.
+        assert!(
+            msg.contains("Failed to initialize") || msg.to_lowercase().contains("url"),
+            "expected BadDocumentURL error, got: {}",
+            msg
+        );
     }
 }

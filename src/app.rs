@@ -1,5 +1,5 @@
 use crate::config::{CompactMode, Config};
-use crate::feed::{Feed, FeedCategory, FeedItem};
+use crate::feed::{ExtractedArticle, Feed, FeedCategory, FeedItem};
 use crate::ui::ColorScheme;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -143,6 +143,25 @@ pub struct App {
     /// disabled or the template failed to tokenize at startup (in which case
     /// a startup warning is surfaced).
     pub exec_on_new_template: Option<Vec<String>>,
+    /// Per-item full-text extraction cache. Keyed by the same item_id scheme
+    /// as `read_items` / `starred_items`. In-memory only; not persisted.
+    pub extracted: HashMap<String, ExtractionState>,
+    /// Insertion order for `extracted`, used to drop the oldest entry when
+    /// the cache hits `EXTRACTED_CACHE_CAP`.
+    pub extracted_order: VecDeque<String>,
+    /// Feed URLs that have `fulltext = true` in config and should trigger
+    /// auto-extraction for newly-seen items on each refresh. Same derivation
+    /// pattern as `feed_headers` / `feed_refresh_intervals`.
+    pub fulltext_feeds: HashSet<String>,
+    /// When the focused article has a `Ready` extraction, this flag controls
+    /// whether the detail view renders the extracted text or the original
+    /// summary. Single global toggle (not per-item) — simplest UX and the
+    /// detail view only ever shows one article at a time.
+    pub show_extracted: bool,
+    /// Queue of extraction requests for the TUI loop to spawn worker threads
+    /// for. Decouples request-time (event handler) from spawn-time (loop
+    /// drain) so events.rs doesn't need the thread-handle / channel.
+    pub pending_extraction_requests: VecDeque<ExtractionRequest>,
 }
 
 /// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
@@ -190,6 +209,32 @@ pub enum AddFeedResult {
         page_url: String,
     },
 }
+
+/// State of a per-item full-text extraction. Lives only in-memory: a
+/// restart re-fetches on demand or via the next refresh for fulltext-flagged
+/// feeds. No on-disk persistence by design — saves us from cache-invalidation
+/// logic and bounds storage growth.
+#[derive(Clone, Debug)]
+pub enum ExtractionState {
+    Pending,
+    Ready(ExtractedArticle),
+    Failed(String),
+}
+
+/// A queued request for the TUI loop to spawn a worker thread for. Filled
+/// in `request_extraction_for_current` and `enqueue_auto_extractions`,
+/// drained in `tui.rs` each tick (same shape as `pending_macro_steps`).
+#[derive(Clone, Debug)]
+pub struct ExtractionRequest {
+    pub id: String,
+    pub url: String,
+}
+
+/// Cap on the number of cached extracted articles. Auto-fetch over a big
+/// feed could otherwise accumulate state monotonically across a long
+/// session. Insertion-order LRU eviction (oldest cache entries are dropped
+/// first) — `extracted_order` tracks the insertion sequence.
+pub const EXTRACTED_CACHE_CAP: usize = 500;
 
 #[derive(Serialize, Deserialize)]
 struct SavedData {
@@ -254,6 +299,14 @@ impl App {
             .default_feeds
             .iter()
             .filter_map(|f| f.refresh_interval.map(|interval| (f.url.clone(), interval)))
+            .collect();
+
+        // Build the set of URLs that opted into full-text auto-extraction
+        let fulltext_feeds: HashSet<String> = config
+            .default_feeds
+            .iter()
+            .filter(|f| f.fulltext.unwrap_or(false))
+            .map(|f| f.url.clone())
             .collect();
 
         // Parse last session time from saved data
@@ -351,6 +404,11 @@ impl App {
             feeds_seeded: saved_data.feeds_seeded,
             pending_macro_steps: VecDeque::new(),
             exec_on_new_template,
+            extracted: HashMap::new(),
+            extracted_order: VecDeque::new(),
+            fulltext_feeds,
+            show_extracted: true,
+            pending_extraction_requests: VecDeque::new(),
         };
 
         app.update_dashboard();
@@ -908,10 +966,23 @@ impl App {
                 // feeds_seeded and its item IDs would stay in seen_items
                 // forever, growing the persisted JSON file monotonically.
                 self.feeds_seeded.remove(&url);
+                let mut removed_ids: Vec<String> = Vec::new();
                 for item in &self.feeds[idx].items {
                     let id = make_item_id(&self.feeds[idx], item);
                     self.seen_items.remove(&id);
+                    removed_ids.push(id);
                 }
+                // Drop in-memory extracted full-text for the removed items
+                // too — keeping them would never expire (no persistence)
+                // but they're keyed on item ids that no longer resolve.
+                for id in &removed_ids {
+                    if self.extracted.remove(id).is_some() {
+                        if let Some(pos) = self.extracted_order.iter().position(|x| x == id) {
+                            self.extracted_order.remove(pos);
+                        }
+                    }
+                }
+                self.fulltext_feeds.remove(&url);
 
                 // Remove from feeds
                 self.feeds.remove(idx);
@@ -1694,6 +1765,134 @@ impl App {
         key: &crossterm::event::KeyEvent,
     ) -> Option<&crate::keybindings::MacroBinding> {
         self.macros.iter().find(|m| m.trigger.matches(key))
+    }
+
+    /// Look up extraction state for an item by its `(feed_idx, item_idx)`.
+    /// Returns `None` if the indices don't resolve or no extraction has been
+    /// requested for that item.
+    pub fn extraction_state_for(
+        &self,
+        feed_idx: usize,
+        item_idx: usize,
+    ) -> Option<&ExtractionState> {
+        let id = self.get_item_id(feed_idx, item_idx);
+        if id.is_empty() {
+            None
+        } else {
+            self.extracted.get(&id)
+        }
+    }
+
+    /// Insert an extraction state into the cache and bump LRU order. If the
+    /// id is already present, the existing entry is replaced and the order
+    /// entry is moved to the end. If we're at the cap, the oldest entry is
+    /// evicted.
+    pub fn record_extraction_result(&mut self, id: String, result: Result<ExtractedArticle>) {
+        if id.is_empty() {
+            return;
+        }
+        let state = match result {
+            Ok(article) => ExtractionState::Ready(article),
+            Err(e) => ExtractionState::Failed(format!("{}", e)),
+        };
+        self.insert_extraction(id, state);
+    }
+
+    /// Mark an item as `Pending` and append the request to the spawn queue.
+    /// No-op if the item already has any state (Pending / Ready / Failed) —
+    /// callers should clear or re-request explicitly.
+    pub fn request_extraction(&mut self, id: String, url: String) {
+        if id.is_empty() || url.is_empty() {
+            return;
+        }
+        if self.extracted.contains_key(&id) {
+            return;
+        }
+        self.insert_extraction(id.clone(), ExtractionState::Pending);
+        self.pending_extraction_requests
+            .push_back(ExtractionRequest { id, url });
+    }
+
+    fn insert_extraction(&mut self, id: String, state: ExtractionState) {
+        // If id is already present, move its LRU position to most-recent and
+        // overwrite the state.
+        if let Some(existing) = self.extracted.get_mut(&id) {
+            *existing = state;
+            if let Some(pos) = self.extracted_order.iter().position(|x| x == &id) {
+                self.extracted_order.remove(pos);
+            }
+            self.extracted_order.push_back(id);
+            return;
+        }
+        // New entry — evict oldest if we're at the cap. Skip eviction if the
+        // oldest entry is currently Pending (it has an in-flight thread that
+        // will try to write back).
+        while self.extracted_order.len() >= EXTRACTED_CACHE_CAP {
+            let evict = match self.extracted_order.front() {
+                Some(front) => front.clone(),
+                None => break,
+            };
+            let is_pending = matches!(self.extracted.get(&evict), Some(ExtractionState::Pending));
+            self.extracted_order.pop_front();
+            if !is_pending {
+                self.extracted.remove(&evict);
+            } else {
+                // Pending entry — re-insert at the back so we don't busy-loop
+                // evicting it. The eventual write-back will land normally.
+                self.extracted_order.push_back(evict);
+                break;
+            }
+        }
+        self.extracted.insert(id.clone(), state);
+        self.extracted_order.push_back(id);
+    }
+
+    /// Handler for the FetchFullText keybinding. Resolves the focused
+    /// article, then either toggles the view (if extraction is Ready) or
+    /// queues a new extraction request. Re-queues on `Failed` so the user
+    /// can retry. No-op on `Pending` (extraction already in flight).
+    pub fn toggle_or_request_fulltext(&mut self) {
+        let Some((feed_idx, item_idx)) = self.current_article_indices() else {
+            self.error = Some("No article in focus".to_string());
+            return;
+        };
+        let id = self.get_item_id(feed_idx, item_idx);
+        if id.is_empty() {
+            self.error = Some("No article in focus".to_string());
+            return;
+        }
+        let url = match self
+            .feeds
+            .get(feed_idx)
+            .and_then(|f| f.items.get(item_idx))
+            .and_then(|i| i.link.clone())
+        {
+            Some(u) => u,
+            None => {
+                self.error = Some("Article has no URL".to_string());
+                return;
+            }
+        };
+        match self.extracted.get(&id) {
+            Some(ExtractionState::Ready(_)) => {
+                self.show_extracted = !self.show_extracted;
+            }
+            Some(ExtractionState::Pending) => {
+                // already in flight — leave it
+            }
+            Some(ExtractionState::Failed(_)) => {
+                self.extracted.remove(&id);
+                if let Some(pos) = self.extracted_order.iter().position(|x| x == &id) {
+                    self.extracted_order.remove(pos);
+                }
+                self.show_extracted = true;
+                self.request_extraction(id, url);
+            }
+            None => {
+                self.show_extracted = true;
+                self.request_extraction(id, url);
+            }
+        }
     }
 }
 
@@ -2586,5 +2785,93 @@ mod tests {
         );
         assert!(parsed.seen_items.is_empty());
         assert!(parsed.feeds_seeded.is_empty());
+    }
+
+    fn dummy_extracted(text: &str) -> ExtractedArticle {
+        ExtractedArticle {
+            title: "T".to_string(),
+            plain_text: text.to_string(),
+            byline: None,
+            site_name: None,
+            source_url: "https://ex.com/a".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_request_extraction_creates_pending_and_enqueues() {
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending)
+        ));
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_request_extraction_idempotent_for_already_pending() {
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        // No double-queue: second call must be a no-op because state is Pending.
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_record_extraction_result_transitions_to_ready() {
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("body")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_record_extraction_result_transitions_to_failed() {
+        let mut app = App::new();
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.record_extraction_result("id1".to_string(), Err(anyhow::anyhow!("boom")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Failed(msg)) => assert!(msg.contains("boom")),
+            other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lru_evicts_oldest_at_cap() {
+        let mut app = App::new();
+        // Insert one more than the cap; the first id must be evicted.
+        for i in 0..EXTRACTED_CACHE_CAP + 1 {
+            let id = format!("id{}", i);
+            app.record_extraction_result(id, Ok(dummy_extracted("x")));
+        }
+        assert!(!app.extracted.contains_key("id0"), "oldest must be evicted");
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    #[test]
+    fn test_remove_current_feed_prunes_extracted_cache() {
+        let mut app = make_test_app();
+        // Seed extraction state for items in the first feed.
+        let id_old = app.get_item_id(0, 0);
+        let id_new = app.get_item_id(0, 1);
+        app.record_extraction_result(id_old.clone(), Ok(dummy_extracted("a")));
+        app.record_extraction_result(id_new.clone(), Ok(dummy_extracted("b")));
+        assert_eq!(app.extracted.len(), 2);
+
+        // Remove the first feed.
+        app.selected_feed = Some(0);
+        app.remove_current_feed().ok();
+
+        assert!(
+            !app.extracted.contains_key(&id_old) && !app.extracted.contains_key(&id_new),
+            "extracted entries for removed feed must be pruned"
+        );
+        assert!(
+            app.extracted_order.is_empty(),
+            "LRU order must be pruned in sync with the map"
+        );
     }
 }
