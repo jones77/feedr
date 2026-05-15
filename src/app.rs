@@ -54,6 +54,7 @@ pub enum InputMode {
     FilterMode,
     CategoryNameInput,    // For creating/renaming categories
     SelectDiscoveredFeed, // For picking from auto-discovered feeds
+    ArticleSearch,        // In-article find: live query, n/N to jump, ESC to clear
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +176,38 @@ pub struct App {
     /// evicted-and-recreated slot can't accidentally satisfy the new
     /// request — `record_extraction_result` matches the generation.
     pub next_extraction_generation: u64,
+    /// In-article find query. Persists across Enter/Esc transitions until
+    /// the user clears it (Esc while in ArticleSearch input mode) or moves
+    /// focus to a different article.
+    pub article_search_query: String,
+    /// Index of the currently-focused match within `article_search_matches`,
+    /// or `None` when there are no matches.
+    pub article_search_current: Option<usize>,
+    /// Matches cached by the detail renderer each frame for use by `n`/`N`
+    /// in event handling. Always re-derived from `article_body_cache` +
+    /// `article_search_query` at render time, so this list is consistent
+    /// with what's drawn on screen.
+    pub article_search_matches: Vec<ArticleMatch>,
+    /// Cached body text fed to the detail view's `Paragraph`. Written by
+    /// the renderer every frame, read by `next_article_match` /
+    /// `prev_article_match` to compute wrapped-row scroll targets.
+    pub article_body_cache: String,
+    /// Cached content width (post-border, post-padding) used to compute
+    /// wrapped-row positions when jumping to a match.
+    pub article_body_width_cache: usize,
+}
+
+/// A single in-article search match, indexed against the rendered body's
+/// `'\n'`-separated logical lines (the same split the renderer uses to
+/// build the `Vec<Line>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArticleMatch {
+    /// 0-based index into `body.split('\n')`.
+    pub line: usize,
+    /// Byte offset of the match start within that line.
+    pub start: usize,
+    /// Byte offset of the match end (exclusive) within that line.
+    pub end: usize,
 }
 
 /// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
@@ -467,6 +500,11 @@ impl App {
             last_detail_focus: None,
             pending_extraction_requests: VecDeque::new(),
             next_extraction_generation: 0,
+            article_search_query: String::new(),
+            article_search_current: None,
+            article_search_matches: Vec::new(),
+            article_body_cache: String::new(),
+            article_body_width_cache: 0,
         };
 
         app.update_dashboard();
@@ -1518,7 +1556,61 @@ impl App {
     /// Exit the detail view and reset scroll position
     pub fn exit_detail_view(&mut self, new_view: View) {
         self.detail_vertical_scroll = 0;
+        self.clear_article_search();
         self.view = new_view;
+    }
+
+    /// Drop any in-article search state. Called when the focused article
+    /// changes, when the user presses `Esc` while typing a query, or when
+    /// the detail view is exited.
+    pub fn clear_article_search(&mut self) {
+        self.article_search_query.clear();
+        self.article_search_current = None;
+        self.article_search_matches.clear();
+    }
+
+    /// Advance the in-article match cursor by one and scroll the detail
+    /// viewport so the new match is visible. No-op when there are no
+    /// matches. Wraps around to 0 past the last match.
+    pub fn next_article_match(&mut self) {
+        if self.article_search_matches.is_empty() {
+            return;
+        }
+        let cur = self.article_search_current.unwrap_or(0);
+        let next = (cur + 1) % self.article_search_matches.len();
+        self.article_search_current = Some(next);
+        self.scroll_to_current_article_match();
+    }
+
+    /// Move the in-article match cursor back by one. Wraps from 0 to the
+    /// last match. No-op when there are no matches.
+    pub fn prev_article_match(&mut self) {
+        if self.article_search_matches.is_empty() {
+            return;
+        }
+        let len = self.article_search_matches.len();
+        let cur = self.article_search_current.unwrap_or(0);
+        let prev = if cur == 0 { len - 1 } else { cur - 1 };
+        self.article_search_current = Some(prev);
+        self.scroll_to_current_article_match();
+    }
+
+    fn scroll_to_current_article_match(&mut self) {
+        let Some(idx) = self.article_search_current else {
+            return;
+        };
+        let Some(m) = self.article_search_matches.get(idx) else {
+            return;
+        };
+        // Leave two rows of context above the match so the user can read
+        // the paragraph it lives in, not just the match itself.
+        let row = wrapped_row_of_line(
+            &self.article_body_cache,
+            m.line,
+            self.article_body_width_cache,
+        );
+        self.detail_vertical_scroll = row.saturating_sub(2);
+        // Final clamp happens on the next render via `clamp_detail_scroll`.
     }
 
     /// Check if auto-refresh should trigger
@@ -2113,9 +2205,100 @@ impl App {
         let current_focus = self.current_article_indices();
         if self.last_detail_focus != current_focus {
             self.show_extracted = true;
+            // A `/foo` left over from the previous article would be
+            // misleading on a brand new body — drop it on focus change.
+            self.clear_article_search();
             self.last_detail_focus = current_focus;
         }
     }
+}
+
+/// Find all occurrences of `query` in `body` using ripgrep-style smart-case
+/// matching: case-sensitive when `query` contains any uppercase character
+/// (Unicode-aware), case-insensitive (ASCII fold) otherwise. Returns an
+/// empty `Vec` for an empty query. Lines are indexed by `body.split('\n')`
+/// so the result aligns with what the detail renderer draws.
+pub fn find_article_matches(body: &str, query: &str) -> Vec<ArticleMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let case_sensitive = query.chars().any(|c| c.is_uppercase());
+    // `to_ascii_lowercase` is length-preserving (only ASCII A-Z change),
+    // so byte offsets into the folded haystack remain valid against the
+    // original line. Non-ASCII characters in case-insensitive mode are
+    // matched literally — a known v1 limitation.
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_ascii_lowercase()
+    };
+    let needle_len = needle.len();
+    let mut out = Vec::new();
+    for (line_idx, line) in body.split('\n').enumerate() {
+        if case_sensitive {
+            scan_line(line, &needle, needle_len, line_idx, &mut out);
+        } else {
+            let folded = line.to_ascii_lowercase();
+            scan_line(&folded, &needle, needle_len, line_idx, &mut out);
+        }
+    }
+    out
+}
+
+fn scan_line(
+    haystack: &str,
+    needle: &str,
+    needle_len: usize,
+    line_idx: usize,
+    out: &mut Vec<ArticleMatch>,
+) {
+    let mut start = 0;
+    while start <= haystack.len() {
+        let rest = &haystack[start..];
+        match rest.find(needle) {
+            Some(rel) => {
+                let pos = start + rel;
+                let end = pos + needle_len;
+                out.push(ArticleMatch {
+                    line: line_idx,
+                    start: pos,
+                    end,
+                });
+                // Step past the match (guard against zero-length needle —
+                // we already filter that, but belt-and-braces).
+                start = end.max(pos + 1);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Cumulative wrapped-row count for source lines `0..target_line_idx`.
+/// Matches the per-line walk in `count_wrapped_lines` so scroll positions
+/// remain consistent with how `Paragraph` lays out the body. Returns 0 for
+/// `target_line_idx == 0` or a zero `width`.
+pub fn wrapped_row_of_line(body: &str, target_line_idx: usize, width: usize) -> u16 {
+    if width == 0 || target_line_idx == 0 {
+        return 0;
+    }
+    let mut row: u16 = 0;
+    for (i, line) in body.split('\n').enumerate() {
+        if i >= target_line_idx {
+            break;
+        }
+        if line.is_empty() {
+            row = row.saturating_add(1);
+        } else {
+            let lw = unicode_width::UnicodeWidthStr::width(line);
+            if lw == 0 {
+                row = row.saturating_add(1);
+            } else {
+                let wrapped = lw.div_ceil(width).max(1);
+                row = row.saturating_add(wrapped as u16);
+            }
+        }
+    }
+    row
 }
 
 /// Build an `ArticleContext` directly from a `Feed` + `FeedItem` pair —
@@ -3677,5 +3860,178 @@ mod tests {
             vec!["first".to_string(), "second".to_string()],
             "watchdog must NOT promote a Failed entry to MRU — would let it outlive newer Ready slots"
         );
+    }
+
+    // ── In-article search helpers ─────────────────────────────────────
+
+    #[test]
+    fn test_find_article_matches_empty_query_returns_empty() {
+        assert!(find_article_matches("anything goes here", "").is_empty());
+        assert!(find_article_matches("", "").is_empty());
+    }
+
+    #[test]
+    fn test_find_article_matches_case_insensitive_when_query_all_lowercase() {
+        let body = "Foo bar FOO baz foo";
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 3);
+        // All on line 0; starts at byte offsets 0, 8, 16.
+        assert_eq!(
+            matches[0],
+            ArticleMatch {
+                line: 0,
+                start: 0,
+                end: 3
+            }
+        );
+        assert_eq!(
+            matches[1],
+            ArticleMatch {
+                line: 0,
+                start: 8,
+                end: 11
+            }
+        );
+        assert_eq!(
+            matches[2],
+            ArticleMatch {
+                line: 0,
+                start: 16,
+                end: 19
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_article_matches_case_sensitive_when_query_has_uppercase() {
+        // Smart-case: "Foo" has uppercase → case-sensitive, so only the
+        // first occurrence matches (the FOO and foo variants are skipped).
+        let body = "Foo bar FOO baz foo";
+        let matches = find_article_matches(body, "Foo");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0],
+            ArticleMatch {
+                line: 0,
+                start: 0,
+                end: 3
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_article_matches_across_multiple_lines() {
+        let body = "first line\nsecond foo line\nthird foo and foo again";
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[0].start, 7);
+        assert_eq!(matches[1].line, 2);
+        assert_eq!(matches[1].start, 6);
+        assert_eq!(matches[2].line, 2);
+        assert_eq!(matches[2].start, 14);
+    }
+
+    #[test]
+    fn test_find_article_matches_no_matches_returns_empty() {
+        assert!(find_article_matches("hello world", "xyz").is_empty());
+    }
+
+    #[test]
+    fn test_wrapped_row_of_line_zero_returns_zero() {
+        let body = "one\ntwo\nthree";
+        assert_eq!(wrapped_row_of_line(body, 0, 80), 0);
+    }
+
+    #[test]
+    fn test_wrapped_row_of_line_short_lines_one_row_each() {
+        let body = "one\ntwo\nthree\nfour";
+        // Line 2 ("three") starts at row 2 — preceded by "one" (1 row) and
+        // "two" (1 row).
+        assert_eq!(wrapped_row_of_line(body, 2, 80), 2);
+        assert_eq!(wrapped_row_of_line(body, 3, 80), 3);
+    }
+
+    #[test]
+    fn test_wrapped_row_of_line_accounts_for_wrap() {
+        // 12-char line in a 5-wide viewport wraps to ceil(12/5) = 3 rows.
+        let body = "aaaaaaaaaaaa\nshort";
+        assert_eq!(wrapped_row_of_line(body, 1, 5), 3);
+    }
+
+    #[test]
+    fn test_wrapped_row_of_line_empty_width_returns_zero() {
+        assert_eq!(wrapped_row_of_line("foo\nbar", 1, 0), 0);
+    }
+
+    #[test]
+    fn test_next_article_match_wraps_and_advances() {
+        let mut app = App::new();
+        app.article_body_cache = "alpha\nbeta\nalpha".to_string();
+        app.article_body_width_cache = 80;
+        app.article_search_query = "alpha".to_string();
+        app.article_search_matches =
+            find_article_matches(&app.article_body_cache, &app.article_search_query);
+        assert_eq!(app.article_search_matches.len(), 2);
+        app.article_search_current = Some(0);
+
+        app.next_article_match();
+        assert_eq!(app.article_search_current, Some(1));
+        // Wraps to 0 past the end.
+        app.next_article_match();
+        assert_eq!(app.article_search_current, Some(0));
+    }
+
+    #[test]
+    fn test_prev_article_match_wraps_to_last() {
+        let mut app = App::new();
+        app.article_body_cache = "alpha\nalpha\nalpha".to_string();
+        app.article_body_width_cache = 80;
+        app.article_search_query = "alpha".to_string();
+        app.article_search_matches =
+            find_article_matches(&app.article_body_cache, &app.article_search_query);
+        app.article_search_current = Some(0);
+
+        app.prev_article_match();
+        assert_eq!(app.article_search_current, Some(2));
+        app.prev_article_match();
+        assert_eq!(app.article_search_current, Some(1));
+    }
+
+    #[test]
+    fn test_next_article_match_noop_when_empty() {
+        let mut app = App::new();
+        app.article_search_current = None;
+        app.next_article_match();
+        assert_eq!(app.article_search_current, None);
+        app.prev_article_match();
+        assert_eq!(app.article_search_current, None);
+    }
+
+    #[test]
+    fn test_clear_article_search_resets_all_fields() {
+        let mut app = App::new();
+        app.article_search_query = "foo".to_string();
+        app.article_search_current = Some(2);
+        app.article_search_matches = vec![ArticleMatch {
+            line: 0,
+            start: 0,
+            end: 3,
+        }];
+        app.clear_article_search();
+        assert!(app.article_search_query.is_empty());
+        assert_eq!(app.article_search_current, None);
+        assert!(app.article_search_matches.is_empty());
+    }
+
+    #[test]
+    fn test_exit_detail_view_clears_article_search() {
+        let mut app = App::new();
+        app.article_search_query = "foo".to_string();
+        app.detail_vertical_scroll = 42;
+        app.exit_detail_view(View::FeedItems);
+        assert!(app.article_search_query.is_empty());
+        assert_eq!(app.detail_vertical_scroll, 0);
+        assert_eq!(app.view, View::FeedItems);
     }
 }

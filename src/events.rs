@@ -836,8 +836,19 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                 _ if app.key_matches(KeyAction::ToggleRead, &key) => {
                     handle_toggle_read_current(app);
                 }
-                _ if app.key_matches(KeyAction::OpenSearch, &key) => {
-                    handle_open_search(app);
+                // In-article find: `/` enters ArticleSearch input mode,
+                // n/N jump between matches (handled here so they're no-ops
+                // when no query is active rather than swallowing the key).
+                // Checked before `OpenSearch` so `/` in detail view means
+                // article-search, not cross-feed search.
+                _ if app.key_matches(KeyAction::OpenArticleSearch, &key) => {
+                    app.input_mode = InputMode::ArticleSearch;
+                }
+                _ if app.key_matches(KeyAction::NextMatch, &key) => {
+                    app.next_article_match();
+                }
+                _ if app.key_matches(KeyAction::PrevMatch, &key) => {
+                    app.prev_article_match();
                 }
                 _ if app.key_matches(KeyAction::Help, &key) => {
                     handle_show_help(app);
@@ -1195,6 +1206,30 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                 app.input.pop();
                 let query = app.input.clone();
                 app.live_search(&query);
+            }
+            _ => {}
+        },
+        // In-article find. Live updates: matches and highlights are
+        // re-derived from `article_search_query` by the detail renderer
+        // every frame, so the keypress just mutates the query and lets the
+        // next render do the rest. `Enter` commits (keeps highlights);
+        // `Esc` clears (no highlights, no footer). `current` is reset on
+        // edit so the next `n` lands on the first match of the new query.
+        InputMode::ArticleSearch => match key.code {
+            KeyCode::Enter => {
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                app.clear_article_search();
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char(c) => {
+                app.article_search_query.push(c);
+                app.article_search_current = None;
+            }
+            KeyCode::Backspace => {
+                app.article_search_query.pop();
+                app.article_search_current = None;
             }
             _ => {}
         },
@@ -2112,5 +2147,144 @@ mod tests {
             "the just-read item must drop out of the unread-only filter"
         );
         assert!(app.error.is_none(), "should not error: {:?}", app.error);
+    }
+
+    // ── In-article search ──────────────────────────────────────────────
+
+    /// Set up an app sitting in the detail view with a focused article so
+    /// the in-article search bindings are reachable. Returns it ready for
+    /// keypress simulation.
+    fn make_detail_app() -> App {
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        app
+    }
+
+    #[test]
+    fn test_slash_in_detail_view_enters_article_search_mode() {
+        let mut app = make_detail_app();
+        let slash = make_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, slash).unwrap();
+        assert_eq!(app.input_mode, InputMode::ArticleSearch);
+    }
+
+    #[test]
+    fn test_article_search_mode_typing_builds_query() {
+        let mut app = make_detail_app();
+        app.input_mode = InputMode::ArticleSearch;
+
+        for c in "foo".chars() {
+            let _ =
+                handle_key_event(&mut app, make_key(KeyCode::Char(c), KeyModifiers::NONE)).unwrap();
+        }
+        assert_eq!(app.article_search_query, "foo");
+        // Current-match cursor is reset on edit; renderer will seed it.
+        assert_eq!(app.article_search_current, None);
+    }
+
+    #[test]
+    fn test_article_search_backspace_shrinks_query() {
+        let mut app = make_detail_app();
+        app.input_mode = InputMode::ArticleSearch;
+        app.article_search_query = "foo".to_string();
+
+        let _ =
+            handle_key_event(&mut app, make_key(KeyCode::Backspace, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.article_search_query, "fo");
+    }
+
+    #[test]
+    fn test_article_search_enter_keeps_query_returns_to_normal() {
+        let mut app = make_detail_app();
+        app.input_mode = InputMode::ArticleSearch;
+        app.article_search_query = "foo".to_string();
+
+        let _ = handle_key_event(&mut app, make_key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.article_search_query, "foo",
+            "Enter must preserve the query so highlights persist"
+        );
+    }
+
+    #[test]
+    fn test_article_search_esc_clears_query_returns_to_normal() {
+        let mut app = make_detail_app();
+        app.input_mode = InputMode::ArticleSearch;
+        app.article_search_query = "foo".to_string();
+        app.article_search_current = Some(2);
+
+        let _ = handle_key_event(&mut app, make_key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.article_search_query.is_empty());
+        assert_eq!(app.article_search_current, None);
+    }
+
+    #[test]
+    fn test_n_in_detail_view_advances_match_cursor() {
+        use crate::app::ArticleMatch;
+
+        let mut app = make_detail_app();
+        // Simulate post-render state: matches list and body cache populated.
+        app.article_search_query = "foo".to_string();
+        app.article_search_matches = vec![
+            ArticleMatch {
+                line: 0,
+                start: 0,
+                end: 3,
+            },
+            ArticleMatch {
+                line: 1,
+                start: 4,
+                end: 7,
+            },
+        ];
+        app.article_body_cache = "foo line\nbar foo line".to_string();
+        app.article_body_width_cache = 80;
+        app.article_search_current = Some(0);
+
+        let n = make_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, n).unwrap();
+        assert_eq!(app.article_search_current, Some(1));
+    }
+
+    #[test]
+    fn test_capital_n_in_detail_view_moves_back() {
+        use crate::app::ArticleMatch;
+
+        let mut app = make_detail_app();
+        app.article_search_query = "foo".to_string();
+        app.article_search_matches = vec![
+            ArticleMatch {
+                line: 0,
+                start: 0,
+                end: 3,
+            },
+            ArticleMatch {
+                line: 1,
+                start: 4,
+                end: 7,
+            },
+        ];
+        app.article_body_cache = "foo line\nbar foo line".to_string();
+        app.article_body_width_cache = 80;
+        app.article_search_current = Some(1);
+
+        let big_n = make_key(KeyCode::Char('N'), KeyModifiers::SHIFT);
+        let _ = handle_key_event(&mut app, big_n).unwrap();
+        assert_eq!(app.article_search_current, Some(0));
+    }
+
+    #[test]
+    fn test_back_from_detail_clears_article_search() {
+        let mut app = make_detail_app();
+        app.article_search_query = "foo".to_string();
+
+        // `h` is Back by default.
+        let back = make_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, back).unwrap();
+        assert!(app.article_search_query.is_empty());
     }
 }
