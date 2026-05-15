@@ -293,10 +293,14 @@ pub fn extract_article(
 
     let final_url = response.url().to_string();
 
-    // Read at most FULLTEXT_MAX_BYTES + 1 so we can detect overflow without
-    // ever allocating beyond cap+1. `reqwest::blocking::Response` implements
-    // `Read`, so `.take()` gives us a hard cap on input consumed.
-    let mut bytes = Vec::with_capacity(64 * 1024);
+    // Preallocate at the hard cap so `read_to_end`'s doubling growth can
+    // never push capacity past it. Without this, starting from a smaller
+    // hint (e.g. 64 KiB) grows the backing buffer to ~8 MiB for a 5 MiB
+    // body — invalidating the "peak allocation ~ FULLTEXT_MAX_BYTES" claim.
+    // Modern allocators don't commit physical pages until written, so a
+    // 5 MiB virtual reservation costs essentially zero physical memory
+    // for the common short-page case.
+    let mut bytes = Vec::with_capacity(FULLTEXT_MAX_BYTES + 1);
     let mut reader = response.take((FULLTEXT_MAX_BYTES as u64) + 1);
     reader
         .read_to_end(&mut bytes)
@@ -380,18 +384,45 @@ fn sniff_meta_charset(head: &[u8]) -> Option<String> {
             continue;
         }
         let tag = &s[tag_start..tag_end];
-        if let Some(charset_idx) = tag.find("charset") {
-            let after = &tag[charset_idx + "charset".len()..];
-            let after = after.trim_start();
-            let after = after.strip_prefix('=').unwrap_or(after).trim_start();
-            let after = after
+        // Walk every `charset` occurrence in the tag, not just the first.
+        // Without this, `<meta name="charset" charset="utf-8">` would match
+        // inside `name="charset"`, get an empty value, and skip to the next
+        // tag — silently missing the real declaration.
+        let mut search_from = 0;
+        while let Some(rel) = tag[search_from..].find("charset") {
+            let charset_idx = search_from + rel;
+            search_from = charset_idx + "charset".len();
+            // Require a word boundary before `charset` so we don't match
+            // inside an attribute value like `name="charset"` (where the
+            // preceding char is `"`) or inside a longer attribute name like
+            // `data-charset`. Allowed boundaries are whitespace or `/`
+            // between attributes, or start-of-tag (`<meta` followed
+            // directly by `charset` is not legal HTML but harmless).
+            let preceded_by_boundary = charset_idx == 0
+                || matches!(
+                    tag.as_bytes().get(charset_idx - 1),
+                    Some(b' ' | b'\t' | b'\n' | b'\r' | b'/')
+                );
+            if !preceded_by_boundary {
+                continue;
+            }
+            // Require `=` to follow (optionally after whitespace). Without
+            // this, `name="charset"` followed by another attribute would
+            // match here even though there is no `charset=` declaration.
+            let after = &tag[search_from..];
+            let after_trimmed = after.trim_start();
+            let Some(rest) = after_trimmed.strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let value = rest
                 .strip_prefix('"')
-                .or_else(|| after.strip_prefix('\''))
-                .unwrap_or(after);
-            let end = after
+                .or_else(|| rest.strip_prefix('\''))
+                .unwrap_or(rest);
+            let end = value
                 .find(['"', '\'', ' ', '>', ';', '/', '\t', '\n', '\r'])
-                .unwrap_or(after.len());
-            let label = &after[..end];
+                .unwrap_or(value.len());
+            let label = &value[..end];
             if !label.is_empty() {
                 return Some(label.to_string());
             }
@@ -1050,6 +1081,45 @@ mod tests {
             </head></html>";
         let label = sniff_meta_charset(html).expect("should find charset");
         assert_eq!(label, "iso-8859-1");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_attribute_value_named_charset() {
+        // Pathological: an attribute whose VALUE is literally "charset"
+        // would have shadowed the real declaration with the old
+        // first-occurrence-wins logic. The tightened sniffer requires
+        // `charset` to be preceded by a word boundary AND followed by `=`,
+        // so the value match is rejected.
+        let html = b"<html><head>\
+            <meta name=\"charset\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_data_attr_with_charset_value() {
+        // `data-foo="charset=bogus"` would have been a false positive under
+        // the old logic (substring + `=` after charset). The boundary check
+        // — `charset` must be preceded by whitespace/`/`/start-of-tag —
+        // rejects it because the preceding char is `"`.
+        let html = b"<html><head>\
+            <meta data-foo=\"charset=bogus\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_longer_attribute_name_prefixed_with_charset() {
+        // Word-boundary check: a hypothetical attribute like
+        // `data-charset="bogus"` shouldn't trigger — the char before
+        // `charset` is `-`, not a boundary.
+        let html = b"<html><head>\
+            <meta data-charset=\"bogus\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
     }
 
     #[test]

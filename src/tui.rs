@@ -343,7 +343,7 @@ fn spawn_feed_refresh(app: &mut App) -> (usize, mpsc::Receiver<(usize, Result<Fe
 /// `run_app` calls this every loop iteration so they fire on the next tick.
 fn spawn_pending_extractions(
     app: &mut App,
-    tx: &mpsc::Sender<(String, Result<ExtractedArticle>)>,
+    tx: &mpsc::Sender<(String, u64, Result<ExtractedArticle>)>,
     inflight: &Arc<AtomicUsize>,
     manual_client: &mut Option<reqwest::blocking::Client>,
     safe_client: &mut Option<reqwest::blocking::Client>,
@@ -366,7 +366,10 @@ fn spawn_pending_extractions(
     // in original order so it retries next tick.
     let mut deferred: Vec<crate::app::ExtractionRequest> = Vec::new();
     loop {
-        let in_use = inflight.load(Ordering::SeqCst);
+        // Relaxed is sufficient: the counter is just a bound on concurrent
+        // workers and doesn't synchronize any other memory. Result hand-off
+        // happens through the mpsc channel, which carries its own ordering.
+        let in_use = inflight.load(Ordering::Relaxed);
         if in_use >= EXTRACTION_MAX_INFLIGHT {
             break;
         }
@@ -378,11 +381,13 @@ fn spawn_pending_extractions(
         // round-trip only to have `record_extraction_result` discard the
         // outcome. Cheap monotonic-correctness gate; must come before the
         // throttle defer so a stale id doesn't bounce back onto the queue.
-        if !matches!(
-            app.extracted.get(&req.id),
-            Some(crate::app::ExtractionState::Pending)
-        ) {
-            continue;
+        // Match BOTH the Pending state and the request's generation —
+        // an evicted-and-recreated slot keeps the same id but gets a fresh
+        // generation, so a stale queued request must be discarded here.
+        match app.extracted.get(&req.id) {
+            Some(crate::app::ExtractionState::Pending { generation, .. })
+                if *generation == req.generation => {}
+            _ => continue,
         }
         let domain = App::extract_domain_from_url(&req.url);
         let too_soon = !rate_limit.is_zero()
@@ -432,12 +437,13 @@ fn spawn_pending_extractions(
         // `last_domain_fetch` stamp until AFTER `thread::Builder::spawn`
         // returns Ok — a rare OS-level spawn failure should re-queue
         // without burning an extra rate-limit window for the next attempt.
-        inflight.fetch_add(1, Ordering::SeqCst);
+        inflight.fetch_add(1, Ordering::Relaxed);
         let ua = user_agent.clone();
         let tx = tx.clone();
         let inflight_for_worker = Arc::clone(inflight);
         let req_id = req.id.clone();
         let req_url = req.url.clone();
+        let req_generation = req.generation;
         // `thread::Builder::spawn` returns `io::Result` instead of panicking
         // on OS-level thread-creation failure (rare, but a panic from the
         // main TUI loop would crash the app). On failure, release the slot
@@ -456,11 +462,11 @@ fn spawn_pending_extractions(
                     "extraction worker panicked (hostile HTML?)"
                 )),
             };
-            let _ = tx.send((req_id, result));
-            inflight_for_worker.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send((req_id, req_generation, result));
+            inflight_for_worker.fetch_sub(1, Ordering::Relaxed);
         });
         if spawn_result.is_err() {
-            inflight.fetch_sub(1, Ordering::SeqCst);
+            inflight.fetch_sub(1, Ordering::Relaxed);
             app.pending_extraction_requests.push_front(req);
             break;
         }
@@ -485,7 +491,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
     // Long-lived channel for extraction worker completions. Outlives any
     // individual refresh because manual `F` extractions can fire at any time.
-    let (extract_tx, extract_rx) = mpsc::channel::<(String, Result<ExtractedArticle>)>();
+    // The `u64` is the request's generation tag, echoed back by the worker so
+    // `record_extraction_result` can drop late results from
+    // evicted-and-recreated slots.
+    let (extract_tx, extract_rx) = mpsc::channel::<(String, u64, Result<ExtractedArticle>)>();
     // Bounds concurrent extraction workers. Each spawned worker bumps this
     // on entry and drops it on exit (even on panic), so the pool never
     // deadlocks even if `dom_smoothie` blows up on hostile HTML.
@@ -614,9 +623,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Drain completed extractions back into app state. This is what
         // flips a `Pending` entry to `Ready` / `Failed`, which the detail
         // view reads from on the next draw.
-        while let Ok((id, result)) = extract_rx.try_recv() {
-            app.record_extraction_result(id, result);
+        while let Ok((id, generation, result)) = extract_rx.try_recv() {
+            app.record_extraction_result(id, generation, result);
         }
+
+        // Watchdog: flip any Pending slot older than `http_timeout * N` to
+        // `Failed("timed out")`. Cheap (cache cap is 500); covers the rare
+        // case where a worker thread is killed externally (OOM, signal,
+        // SIGSEGV in a native dep) and never sends its result.
+        app.prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
 
         if event::poll(timeout)? {
             // Handle user input
@@ -735,9 +750,13 @@ mod tests {
             false,
             false,
         );
-        // simulate a worker thread completing successfully
+        // The request's generation is on the queued ExtractionRequest the
+        // worker would have spawned for. Echoing it back through
+        // `record_extraction_result` simulates the channel hand-off.
+        let gen = app.pending_extraction_requests[0].generation;
         app.record_extraction_result(
             "id1".to_string(),
+            gen,
             Ok(ExtractedArticle {
                 title: "T".to_string(),
                 plain_text: "body".to_string(),
@@ -821,6 +840,82 @@ mod tests {
         // Only the public https URL should make it through.
         assert_eq!(app.pending_extraction_requests.len(), 1);
         assert_eq!(app.pending_extraction_requests[0].url, "https://ex.com/a");
+    }
+
+    /// Regression lock for the "single shared mark per feed arrival" contract.
+    /// `mark_feed_seen` must only be called ONCE per feed delivery, even when
+    /// both `exec_on_new` and `fulltext` are consuming the newly-seen set —
+    /// calling it twice would double-mark and the second consumer would see
+    /// an empty set. The fix lives at the `run_app` call site (gating on
+    /// `exec_on_new_template.is_some() || fulltext_feeds.contains(...)`) and
+    /// then handing the same `&[usize]` to both consumers.
+    #[test]
+    fn test_mark_feed_seen_shared_between_exec_on_new_and_fulltext() {
+        let mut app = App::new();
+        // Configure BOTH consumers for this feed.
+        app.exec_on_new_template = Some(vec!["echo".to_string(), "%t".to_string()]);
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("First", Some("https://ex.com/1")),
+                ("Second", Some("https://ex.com/2")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+
+        // Simulate the first refresh: feed is not yet seeded, so the first
+        // mark seeds silently and returns an empty newly-seen set.
+        let first_seen = crate::app::mark_feed_seen(&mut app, &feed);
+        assert!(
+            first_seen.is_empty(),
+            "first observation of a feed must seed silently"
+        );
+        // Both consumers see the same (empty) list — neither fires.
+        let exec = collect_exec_on_new(&app, &feed, &first_seen);
+        assert!(exec.is_empty(), "exec_on_new must not fire on first fetch");
+        enqueue_fulltext_for_new(&mut app, &feed, &first_seen);
+        assert!(
+            app.pending_extraction_requests.is_empty(),
+            "fulltext must not fire on first fetch"
+        );
+
+        // Second refresh delivers the SAME items + one new item. The single
+        // mark_feed_seen call MUST return only the new index, and both
+        // consumers fed the same slice MUST both observe it. A second
+        // mark_feed_seen call here would return [] (double-mark bug).
+        let feed2 = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("First", Some("https://ex.com/1")),
+                ("Second", Some("https://ex.com/2")),
+                ("Third", Some("https://ex.com/3")),
+            ],
+        );
+        let second_seen = crate::app::mark_feed_seen(&mut app, &feed2);
+        assert_eq!(
+            second_seen,
+            vec![2],
+            "only the genuinely-new item should be reported"
+        );
+        // A duplicate mark — the bug this whole regression test guards
+        // against — would now return an empty slice.
+        let dup = crate::app::mark_feed_seen(&mut app, &feed2);
+        assert!(
+            dup.is_empty(),
+            "calling mark_feed_seen twice for one arrival would starve the second consumer"
+        );
+
+        // The actual contract: both consumers fed the SAME `second_seen`
+        // slice must both react to the new item.
+        let exec = collect_exec_on_new(&app, &feed2, &second_seen);
+        assert_eq!(exec.len(), 1, "exec_on_new must fire for the new item");
+        enqueue_fulltext_for_new(&mut app, &feed2, &second_seen);
+        assert_eq!(
+            app.pending_extraction_requests.len(),
+            1,
+            "fulltext must enqueue for the new item from the same newly-seen slice"
+        );
+        assert_eq!(app.pending_extraction_requests[0].url, "https://ex.com/3");
     }
 
     #[test]

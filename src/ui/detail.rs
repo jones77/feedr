@@ -1,4 +1,5 @@
 use crate::app::{App, ExtractionState};
+use crate::keybindings::{key_display, KeyAction};
 use crate::ui::utils::{count_wrapped_lines, format_content_for_reading, truncate_url};
 use crate::ui::ColorScheme;
 use html2text::from_read;
@@ -143,7 +144,7 @@ pub(super) fn render_item_detail<B: Backend>(
                 Some(ExtractionState::Ready(article)) => {
                     BodySource::Extracted(article.plain_text.clone())
                 }
-                Some(ExtractionState::Pending) => BodySource::Extracting,
+                Some(ExtractionState::Pending { .. }) => BodySource::Extracting,
                 Some(ExtractionState::Failed(reason)) => BodySource::Failed(reason.clone()),
                 None => BodySource::Summary,
             }
@@ -163,15 +164,20 @@ pub(super) fn render_item_detail<B: Backend>(
             }
         };
 
+        // The retry / toggle hints embed the *current* binding for
+        // FetchFullText so they stay correct if the user remaps it.
+        let fulltext_key = key_display(&KeyAction::FetchFullText, &app.keybindings);
+
         let description = match &body_source {
             BodySource::Summary => summary_text(),
             BodySource::Failed(reason) => {
                 // Surface the failure reason at the top, then fall back to
                 // the original summary so the user still has something to
-                // read. Press F again to retry.
+                // read. Press the FetchFullText key again to retry.
                 format!(
-                    "[Full-text extraction failed: {}]\n[Press F to retry — showing summary]\n\n{}",
+                    "[Full-text extraction failed: {}]\n[Press {} to retry — showing summary]\n\n{}",
                     reason,
+                    fulltext_key,
                     summary_text()
                 )
             }
@@ -180,9 +186,9 @@ pub(super) fn render_item_detail<B: Backend>(
                 // Keep the summary visible while the worker is in flight —
                 // a slow site can take several seconds, and replacing the
                 // body with "Fetching…" leaves the user with nothing to
-                // read AND no way to revert (Shift+F is a no-op on Pending).
-                // The scroll-indicator title (see body_label below) carries
-                // the "Extracting…" status instead.
+                // read AND no way to revert (the FetchFullText key is a
+                // no-op on Pending). The scroll-indicator title (see
+                // body_label below) carries the "Extracting…" status.
                 format!(
                     "[Fetching full text… — showing summary]\n\n{}",
                     summary_text()
