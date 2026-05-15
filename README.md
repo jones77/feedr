@@ -24,6 +24,7 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Mark All Read**: Quickly mark all visible items as read with `m`
 - **Article Preview**: Toggle an inline preview pane in the dashboard view
 - **Link Extraction**: Extract and browse all links from an article with `l`
+- **Full-Text Extraction**: Strip away summaries and read the actual article content inline via Mozilla Readability — manual on `Shift+F`, or auto-extract on refresh per feed with `fulltext = true`
 - **Help Overlay**: Press `?` for a scrollable keybinding reference overlay
 - **OPML Import**: Bulk import feeds from OPML files via `feedr --import <file.opml>`
 - **Browser Integration**: Open articles in your default browser
@@ -175,6 +176,7 @@ All keybindings below show their defaults. You can remap any action via the `[ke
 | `s` | Toggle starred |
 | `o` | Open item in browser |
 | `l` | Extract and show all links |
+| `Shift+F` | Toggle/fetch full-text (Readability) |
 
 #### Starred View
 | Key | Action |
@@ -314,6 +316,23 @@ Cookie = "session=abc123"
 ```
 Headers are sent with every request for that feed, including refreshes.
 
+#### Full-Text Extraction
+Most RSS feeds ship only short summaries. Feedr can fetch the linked article URL and run [Mozilla Readability](https://github.com/mozilla/readability) (via the `dom_smoothie` crate) to extract the actual article body and render it inline.
+
+- **Manual**: in the article detail view, press `Shift+F` to extract the focused article. Press `Shift+F` again to toggle back to the original summary, or after a failure to retry.
+- **Auto on refresh**: set `fulltext = true` on a feed and Feedr will auto-extract newly-seen items on each refresh (same "no firehose" rule as `exec_on_new` — the first observation of a feed seeds silently).
+
+```toml
+[[default_feeds]]
+url = "https://example.com/summary-only-feed.xml"
+fulltext = true
+```
+
+Notes:
+- Extracted content is **in-memory only** — it is not persisted to disk. A restart re-extracts on demand.
+- Per-feed auth headers are **not** sent to the article URL (article URLs are typically third-party hosts; forwarding `Authorization` would leak credentials).
+- Pages with very short extracted bodies (likely JS-rendered or behind a wall) fail gracefully and fall back to showing the original summary.
+
 ### External-Command Hooks
 
 Feedr supports newsboat-style external commands for two workflows: **macros** (key-triggered chains that act on the focused article) and **`exec_on_new`** (a notification hook fired per newly-seen item after each refresh).
@@ -417,6 +436,7 @@ toggle_theme = "F5"                # Function keys
 | `open_category_management` | `Ctrl+c` | Category management |
 | `assign_category` | `c` | Assign category to feed |
 | `extract_links` | `l` | Extract links from article |
+| `fetch_full_text` | `Shift+F` | Toggle/fetch full-text (Readability) |
 | `scroll_preview_up` | `Shift+K`, `Shift+Up` | Scroll preview up |
 | `scroll_preview_down` | `Shift+J`, `Shift+Down` | Scroll preview down |
 | `toggle_expand` | `Space` | Expand/collapse in tree view |

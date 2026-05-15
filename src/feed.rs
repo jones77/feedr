@@ -1,14 +1,33 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use dom_smoothie::{Config as ReadabilityConfig, Readability};
 use feed_rs::parser;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Read;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
+
+/// Cap on response body size for article extraction. Anything larger is
+/// almost certainly not a typical article page and would only burn CPU in
+/// the Readability DOM walker.
+const FULLTEXT_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Minimum text length the extracted article body must contain to be
+/// considered useful. Pages below this are treated as "page appears empty"
+/// — usually JS-rendered shells, login walls, or 404 placeholders.
+const FULLTEXT_MIN_LENGTH: usize = 200;
+
+/// Number of leading bytes of the response we sniff for `<meta charset="…">`
+/// when the Content-Type header doesn't carry one. The HTML5 spec mandates
+/// any in-document declaration must appear in the first 1024 bytes of the
+/// document, so reading more is just wasted work.
+const META_SNIFF_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Feed {
@@ -98,6 +117,352 @@ pub struct DiscoveredFeed {
     pub url: String,
     pub title: String,
     pub feed_type: FeedType,
+}
+
+/// Outcome of a successful Readability extraction against an article URL.
+/// Decoupled from `dom_smoothie::Article` so the upstream crate can be
+/// swapped without rippling through the rest of the codebase.
+#[derive(Clone, Debug)]
+pub struct ExtractedArticle {
+    pub title: String,
+    pub plain_text: String,
+    pub byline: Option<String>,
+    pub site_name: Option<String>,
+    pub source_url: String,
+}
+
+/// Validates that `url` is safe to fetch on the *auto-fulltext* path (i.e.
+/// without a user click). Rejects non-http(s) schemes and hostnames that
+/// resolve to private / loopback / link-local addresses, since auto-mode
+/// fetches whatever the feed XML put in `<link>` — a hostile feed could
+/// otherwise probe the user's internal network. Manual `Shift+F` is the
+/// user's explicit action and bypasses this check.
+pub fn is_safe_auto_url(url: &str) -> bool {
+    let parsed = match Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = match parsed.host() {
+        Some(h) => h,
+        None => return false,
+    };
+    match host {
+        url::Host::Ipv4(ip) => is_global_ip(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => is_global_ip(IpAddr::V6(ip)),
+        url::Host::Domain(name) => {
+            // Reject obvious local-only names; a hostile feed cannot use
+            // these to probe RFC1918 space, but we still want to avoid
+            // hitting "localhost"-style endpoints by accident.
+            let n = name.to_ascii_lowercase();
+            if n == "localhost" || n.ends_with(".localhost") || n.ends_with(".local") {
+                return false;
+            }
+            // DNS resolution itself happens later in reqwest; we don't
+            // resolve here because that would block. The intent of the
+            // check is "no obvious internal target encoded directly in
+            // the URL" — DNS rebinding is out of scope for a feed reader.
+            true
+        }
+    }
+}
+
+fn is_global_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                // Multicast 224.0.0.0/4 — IPv6 multicast (ff00::/8) is
+                // already rejected below; this closes the v4/v6 asymmetry.
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
+                // CGNAT 100.64.0.0/10
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                // IETF protocol-assignments 192.0.0.0/24
+                || (v4.octets()[0] == 192
+                    && v4.octets()[1] == 0
+                    && v4.octets()[2] == 0))
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let seg1 = v6.segments()[1];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // unique-local fc00::/7
+                || (seg0 & 0xFE00) == 0xFC00
+                // link-local fe80::/10
+                || (seg0 & 0xFFC0) == 0xFE80
+                // deprecated site-local fec0::/10
+                || (seg0 & 0xFFC0) == 0xFEC0
+                // multicast ff00::/8
+                || (seg0 & 0xFF00) == 0xFF00
+                // 6to4 2002::/16 — routes to embedded IPv4 via 6to4 relays,
+                // so an address like 2002:a9fe:a9fe:: would reach 169.254.169.254
+                || seg0 == 0x2002
+                // NAT64 well-known prefix 64:ff9b::/96
+                || (seg0 == 0x0064 && seg1 == 0xff9b)
+                // IPv4-mapped — defer to v4 check via the embedded address
+                || v6.to_ipv4_mapped().map(|v4| !is_global_ip(IpAddr::V4(v4))).unwrap_or(false))
+        }
+    }
+}
+
+/// Fetch `url` with `client` and run Mozilla-Readability extraction over the
+/// returned HTML. Feed auth headers are intentionally NOT propagated: the
+/// article URL is on a different host and may be third-party, so leaking
+/// per-feed `Authorization` headers would be a credential leak.
+///
+/// Rejects non-`text/html` responses, oversized bodies (`FULLTEXT_MAX_BYTES`),
+/// and pages whose extracted text falls below `FULLTEXT_MIN_LENGTH` (treated
+/// as JS-rendered or empty). Body is read with a size-bounded reader so peak
+/// allocation cannot exceed the cap, and the response charset is honored so
+/// non-UTF8 pages decode correctly.
+pub fn extract_article(
+    url: &str,
+    client: &reqwest::blocking::Client,
+    user_agent: Option<&str>,
+) -> Result<ExtractedArticle> {
+    // Scheme allowlist — reqwest's blocking client refuses non-http(s) by
+    // default, but this gives a clearer error and makes the policy explicit.
+    let parsed = Url::parse(url).context("Article URL is not a valid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow::anyhow!(
+            "Article URL scheme '{}' is not allowed (only http/https)",
+            parsed.scheme()
+        ));
+    }
+
+    let default_user_agent =
+        "Mozilla/5.0 (compatible; Feedr/1.0; +https://github.com/bahdotsh/feedr)";
+    let ua = user_agent.unwrap_or(default_user_agent);
+
+    let response = client
+        .get(url)
+        .header("User-Agent", ua)
+        .header("Accept", "text/html, application/xhtml+xml, */*;q=0.5")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "gzip, deflate")
+        .send()
+        .context("Failed to fetch article")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "HTTP error {} fetching article from {}",
+            status,
+            url
+        ));
+    }
+
+    let content_type_raw = response
+        .headers()
+        .get("content-type")
+        .and_then(|ct| ct.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_type = content_type_raw.to_lowercase();
+    if !content_type.is_empty()
+        && !content_type.contains("text/html")
+        && !content_type.contains("application/xhtml")
+    {
+        return Err(anyhow::anyhow!(
+            "Article URL did not return HTML (content-type: {})",
+            content_type
+        ));
+    }
+
+    // Reject upfront if Content-Length already exceeds the cap — saves us
+    // the full transfer for obviously oversized responses.
+    if let Some(declared_len) = response
+        .headers()
+        .get("content-length")
+        .and_then(|cl| cl.to_str().ok())
+        .and_then(|cl| cl.parse::<usize>().ok())
+    {
+        if declared_len > FULLTEXT_MAX_BYTES {
+            return Err(anyhow::anyhow!(
+                "Article body too large ({} bytes declared, cap {} bytes)",
+                declared_len,
+                FULLTEXT_MAX_BYTES
+            ));
+        }
+    }
+
+    let final_url = response.url().to_string();
+
+    // Preallocate at the hard cap so `read_to_end`'s doubling growth can
+    // never push capacity past it. Without this, starting from a smaller
+    // hint (e.g. 64 KiB) grows the backing buffer to ~8 MiB for a 5 MiB
+    // body — making the body-buffer ceiling ambiguous. With the
+    // preallocation, the body-buffer ceiling is exactly FULLTEXT_MAX_BYTES;
+    // the downstream DOM allocation inside dom_smoothie is separate
+    // working-set and not bounded here. Modern allocators don't commit
+    // physical pages until written, so a 5 MiB virtual reservation costs
+    // essentially zero physical memory for the common short-page case.
+    let mut bytes = Vec::with_capacity(FULLTEXT_MAX_BYTES + 1);
+    let mut reader = response.take((FULLTEXT_MAX_BYTES as u64) + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .context("Failed to read article body")?;
+    if bytes.len() > FULLTEXT_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "Article body too large (exceeded cap {} bytes)",
+            FULLTEXT_MAX_BYTES
+        ));
+    }
+
+    let html = decode_html_bytes(&bytes, &content_type_raw);
+    extract_from_html(&html, &final_url)
+}
+
+/// Decode `bytes` into a Rust `String` using the encoding declared by the
+/// `Content-Type` header, falling back to `<meta charset>` sniffing in the
+/// first ~1 KB of the document, and finally to UTF-8. Without this, any
+/// non-UTF8 page (Windows-1252, ISO-8859-1, Shift_JIS, GBK, …) produces
+/// U+FFFD-laced mojibake that Readability would then misclassify as too
+/// short.
+pub(crate) fn decode_html_bytes(bytes: &[u8], content_type: &str) -> String {
+    let mut encoding: Option<&'static encoding_rs::Encoding> = None;
+
+    // 1) Honor charset= in the Content-Type header.
+    if let Some(label) = charset_from_content_type(content_type) {
+        encoding = encoding_rs::Encoding::for_label(label.as_bytes());
+    }
+
+    // 2) Otherwise sniff the leading bytes for an in-document <meta charset>.
+    if encoding.is_none() {
+        let sniff_len = bytes.len().min(META_SNIFF_BYTES);
+        if let Some(label) = sniff_meta_charset(&bytes[..sniff_len]) {
+            encoding = encoding_rs::Encoding::for_label(label.as_bytes());
+        }
+    }
+
+    // 3) Default to UTF-8 — same fate `from_utf8_lossy` would have given us,
+    //    but routed through encoding_rs so behavior is uniform.
+    let encoding = encoding.unwrap_or(encoding_rs::UTF_8);
+    let (cow, _enc, _had_errors) = encoding.decode(bytes);
+    cow.into_owned()
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    for part in content_type.split(';') {
+        let lower = part.trim().to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("charset=") {
+            let v = rest.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Sniff `<meta charset="…">` or `<meta http-equiv="Content-Type"
+/// content="…charset=…">` from the leading bytes of an HTML document. Only
+/// matches `charset=` that appears INSIDE a `<meta …>` tag — a loose
+/// substring match would be fooled by `data-charset="x"` attributes or
+/// string literals inside `<script>`. Stays byte-level (latin-1 lossy
+/// decode is fine here: ASCII-superset encodings agree on the bytes we
+/// care about) so we don't have to pick an encoding before we know one.
+fn sniff_meta_charset(head: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let mut cursor = 0;
+    while let Some(rel) = s[cursor..].find("<meta") {
+        let tag_start = cursor + rel;
+        // The character after `<meta` must be whitespace or `/` or `>` so we
+        // don't match e.g. `<metadata>`.
+        let after_name = tag_start + "<meta".len();
+        let next_char = s.as_bytes().get(after_name).copied().unwrap_or(b'>');
+        let is_meta_tag = matches!(next_char, b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>');
+        let tag_end = s[after_name..]
+            .find('>')
+            .map(|e| after_name + e)
+            .unwrap_or(s.len());
+        cursor = tag_end.saturating_add(1);
+        if !is_meta_tag {
+            continue;
+        }
+        let tag = &s[tag_start..tag_end];
+        // Walk every `charset` occurrence in the tag, not just the first.
+        // Without this, `<meta name="charset" charset="utf-8">` would match
+        // inside `name="charset"`, get an empty value, and skip to the next
+        // tag — silently missing the real declaration.
+        let mut search_from = 0;
+        while let Some(rel) = tag[search_from..].find("charset") {
+            let charset_idx = search_from + rel;
+            search_from = charset_idx + "charset".len();
+            // Require a word boundary before `charset` so we don't match
+            // inside an attribute value like `name="charset"` (where the
+            // preceding char is `"`) or inside a longer attribute name like
+            // `data-charset`. Allowed boundaries are whitespace or `/`
+            // between attributes, or start-of-tag (`<meta` followed
+            // directly by `charset` is not legal HTML but harmless).
+            let preceded_by_boundary = charset_idx == 0
+                || matches!(
+                    tag.as_bytes().get(charset_idx - 1),
+                    Some(b' ' | b'\t' | b'\n' | b'\r' | b'/')
+                );
+            if !preceded_by_boundary {
+                continue;
+            }
+            // Require `=` to follow (optionally after whitespace). Without
+            // this, `name="charset"` followed by another attribute would
+            // match here even though there is no `charset=` declaration.
+            let after = &tag[search_from..];
+            let after_trimmed = after.trim_start();
+            let Some(rest) = after_trimmed.strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let value = rest
+                .strip_prefix('"')
+                .or_else(|| rest.strip_prefix('\''))
+                .unwrap_or(rest);
+            let end = value
+                .find(['"', '\'', ' ', '>', ';', '/', '\t', '\n', '\r'])
+                .unwrap_or(value.len());
+            let label = &value[..end];
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Pure Readability step — no I/O. Split out so unit tests can exercise the
+/// extraction + min-length + error-path logic without a network round-trip.
+pub fn extract_from_html(html: &str, source_url: &str) -> Result<ExtractedArticle> {
+    let cfg = ReadabilityConfig {
+        max_elements_to_parse: 9000,
+        ..ReadabilityConfig::default()
+    };
+    let mut readability = Readability::new(html, Some(source_url), Some(cfg))
+        .context("Failed to initialize Readability")?;
+    let article = readability
+        .parse()
+        .context("Readability could not parse article")?;
+
+    if article.length < FULLTEXT_MIN_LENGTH {
+        return Err(anyhow::anyhow!(
+            "Page appears empty (only {} chars of body) — likely JS-rendered or paywalled",
+            article.length
+        ));
+    }
+
+    Ok(ExtractedArticle {
+        title: article.title,
+        plain_text: article.text_content.to_string(),
+        byline: article.byline,
+        site_name: article.site_name,
+        source_url: source_url.to_string(),
+    })
 }
 
 /// Result of fetching a URL that was expected to be a feed.
@@ -219,6 +584,27 @@ impl Feed {
             .timeout(Duration::from_secs(timeout_secs))
             .build()
             .context("Failed to create HTTP client")
+    }
+
+    /// Build an HTTP client whose redirect policy re-validates each hop with
+    /// `is_safe_auto_url`. Used for the auto-fulltext path so a hostile feed
+    /// can't publish a public-looking `<link>` URL that 302s into the user's
+    /// internal network (e.g. RFC1918 / loopback / cloud metadata endpoints).
+    /// The redirect chain is still capped at 10 hops, matching `build_client`.
+    pub fn build_safe_redirect_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.stop();
+                }
+                if !is_safe_auto_url(attempt.url().as_str()) {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            }))
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .context("Failed to create safe-redirect HTTP client")
     }
 
     /// Fetch a URL and return either a parsed feed or discovered feed links.
@@ -547,5 +933,488 @@ mod tests {
         };
         let err = result.into_feed().unwrap_err();
         assert!(err.to_string().contains("No RSS/Atom feed links found"));
+    }
+
+    /// A blog-post-shaped fixture long enough to clear FULLTEXT_MIN_LENGTH
+    /// once Readability strips boilerplate.
+    fn fixture_article_html() -> String {
+        let body = "Feedr is a terminal-based RSS feed reader. It supports \
+            categories, OPML import, and a configurable keybinding system. \
+            This paragraph is repeated several times to ensure the extracted \
+            text content comfortably exceeds the minimum-length threshold \
+            that the extractor enforces before declaring the page empty. ";
+        let mut content = String::new();
+        for _ in 0..5 {
+            content.push_str("<p>");
+            content.push_str(body);
+            content.push_str("</p>");
+        }
+        format!(
+            r#"<!doctype html><html><head>
+                <title>About Feedr</title>
+                <meta name="author" content="Test Author">
+            </head><body>
+                <nav>Home About Contact</nav>
+                <article>
+                    <h1>About Feedr</h1>
+                    {}
+                </article>
+                <footer>Copyright 2026</footer>
+            </body></html>"#,
+            content
+        )
+    }
+
+    #[test]
+    fn test_extract_from_html_succeeds_on_blog_shaped_page() {
+        let html = fixture_article_html();
+        let article = extract_from_html(&html, "https://example.com/post").unwrap();
+        assert!(!article.title.is_empty(), "title should be extracted");
+        assert!(
+            article.plain_text.len() >= FULLTEXT_MIN_LENGTH,
+            "extracted text below minimum: {}",
+            article.plain_text.len()
+        );
+        assert_eq!(article.source_url, "https://example.com/post");
+    }
+
+    #[test]
+    fn test_extract_from_html_rejects_short_content() {
+        let html = r#"<!doctype html><html><body><p>tiny.</p></body></html>"#;
+        let err = extract_from_html(html, "https://example.com/empty").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("empty"),
+            "expected 'empty' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_extract_from_html_rejects_bad_document_url() {
+        let html = fixture_article_html();
+        let err = extract_from_html(&html, "not-a-url").unwrap_err();
+        let msg = format!("{:?}", err);
+        // dom_smoothie's BadDocumentURL wrapped by our context string.
+        assert!(
+            msg.contains("Failed to initialize") || msg.to_lowercase().contains("url"),
+            "expected BadDocumentURL error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_decode_html_bytes_uses_content_type_charset() {
+        // "Café" in Windows-1252: 0x43 0x61 0x66 0xE9
+        let bytes: &[u8] = &[0x43, 0x61, 0x66, 0xE9];
+        let decoded = decode_html_bytes(bytes, "text/html; charset=windows-1252");
+        assert_eq!(decoded, "Café");
+    }
+
+    #[test]
+    fn test_decode_html_bytes_handles_quoted_charset_in_header() {
+        let bytes: &[u8] = &[0x43, 0x61, 0x66, 0xE9];
+        let decoded = decode_html_bytes(bytes, "text/html; charset=\"windows-1252\"");
+        assert_eq!(decoded, "Café");
+    }
+
+    #[test]
+    fn test_decode_html_bytes_falls_back_to_meta_charset() {
+        // Document declares Shift_JIS via <meta>; Content-Type omits charset.
+        // Bytes "日本" in Shift_JIS: 0x93 0xFA 0x96 0x7B.
+        let mut html: Vec<u8> = b"<html><head><meta charset=\"shift_jis\"></head><body>".to_vec();
+        html.extend_from_slice(&[0x93, 0xFA, 0x96, 0x7B]);
+        html.extend_from_slice(b"</body></html>");
+        let decoded = decode_html_bytes(&html, "text/html");
+        assert!(
+            decoded.contains("日本"),
+            "expected meta-sniffed Shift_JIS to decode, got: {}",
+            decoded
+        );
+    }
+
+    #[test]
+    fn test_decode_html_bytes_defaults_to_utf8() {
+        let html = "<html><body>Café</body></html>";
+        let decoded = decode_html_bytes(html.as_bytes(), "");
+        assert!(decoded.contains("Café"));
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_data_charset_attribute() {
+        // A loose substring match would be fooled by `data-charset="bogus"`
+        // and choose `bogus` as the encoding; the tightened sniffer must
+        // only match `charset=` inside an actual <meta> tag.
+        let html = b"<html><head>\
+            <div data-charset=\"bogus-encoding\"></div>\
+            <meta charset=\"windows-1252\">\
+            </head><body>x</body></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(
+            label, "windows-1252",
+            "data-* attribute must be ignored; only <meta charset> wins"
+        );
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_script_content() {
+        // `<script>var x = "charset=evil";</script>` in the head must not
+        // fool the sniffer.
+        let html = b"<html><head>\
+            <script>var s = \"charset=evil-encoding\";</script>\
+            <meta charset=\"utf-8\">\
+            </head><body>x</body></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8", "script literal must be ignored");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_metadata_tag() {
+        // `<metadata>` must not be matched as `<meta>`.
+        let html = b"<html><head>\
+            <metadata>charset=bogus</metadata>\
+            <meta charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_handles_http_equiv_meta() {
+        // The other legal form: <meta http-equiv="Content-Type" content="text/html; charset=…">
+        let html = b"<html><head>\
+            <meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "iso-8859-1");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_attribute_value_named_charset() {
+        // Pathological: an attribute whose VALUE is literally "charset"
+        // would have shadowed the real declaration with the old
+        // first-occurrence-wins logic. The tightened sniffer requires
+        // `charset` to be preceded by a word boundary AND followed by `=`,
+        // so the value match is rejected.
+        let html = b"<html><head>\
+            <meta name=\"charset\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_data_attr_with_charset_value() {
+        // `data-foo="charset=bogus"` would have been a false positive under
+        // the old logic (substring + `=` after charset). The boundary check
+        // — `charset` must be preceded by whitespace/`/`/start-of-tag —
+        // rejects it because the preceding char is `"`.
+        let html = b"<html><head>\
+            <meta data-foo=\"charset=bogus\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_skips_longer_attribute_name_prefixed_with_charset() {
+        // Word-boundary check: a hypothetical attribute like
+        // `data-charset="bogus"` shouldn't trigger — the char before
+        // `charset` is `-`, not a boundary.
+        let html = b"<html><head>\
+            <meta data-charset=\"bogus\" charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_is_safe_auto_url_accepts_public_https() {
+        assert!(is_safe_auto_url("https://example.com/article"));
+        assert!(is_safe_auto_url("http://example.com/article"));
+    }
+
+    #[test]
+    fn test_is_safe_auto_url_rejects_non_http_scheme() {
+        assert!(!is_safe_auto_url("file:///etc/passwd"));
+        assert!(!is_safe_auto_url("ftp://example.com/x"));
+        assert!(!is_safe_auto_url("javascript:alert(1)"));
+        assert!(!is_safe_auto_url("data:text/html,<script>"));
+    }
+
+    #[test]
+    fn test_is_safe_auto_url_rejects_private_ips() {
+        // RFC1918
+        assert!(!is_safe_auto_url("http://10.0.0.1/x"));
+        assert!(!is_safe_auto_url("http://192.168.1.1/x"));
+        assert!(!is_safe_auto_url("http://172.16.0.1/x"));
+        // Loopback
+        assert!(!is_safe_auto_url("http://127.0.0.1/x"));
+        // Link-local (incl. AWS metadata endpoint)
+        assert!(!is_safe_auto_url(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        // CGNAT
+        assert!(!is_safe_auto_url("http://100.64.0.1/x"));
+        // IPv6 loopback / unique-local / link-local
+        assert!(!is_safe_auto_url("http://[::1]/x"));
+        assert!(!is_safe_auto_url("http://[fc00::1]/x"));
+        assert!(!is_safe_auto_url("http://[fe80::1]/x"));
+        // IPv6 deprecated site-local fec0::/10
+        assert!(!is_safe_auto_url("http://[fec0::1]/x"));
+        // IPv4 multicast 224.0.0.0/4 — parity with IPv6 multicast below.
+        assert!(!is_safe_auto_url("http://224.0.0.1/x"));
+        assert!(!is_safe_auto_url("http://239.255.255.250/x"));
+        // IPv6 multicast ff00::/8
+        assert!(!is_safe_auto_url("http://[ff02::1]/x"));
+        // 6to4 wrapping link-local — would route via 6to4 relay to
+        // 169.254.169.254 (cloud metadata).
+        assert!(!is_safe_auto_url("http://[2002:a9fe:a9fe::]/x"));
+        // NAT64 well-known prefix 64:ff9b::/96
+        assert!(!is_safe_auto_url("http://[64:ff9b::a9fe:a9fe]/x"));
+    }
+
+    #[test]
+    fn test_is_safe_auto_url_rejects_localhost_names() {
+        assert!(!is_safe_auto_url("http://localhost/x"));
+        assert!(!is_safe_auto_url("http://printer.local/x"));
+        assert!(!is_safe_auto_url("http://api.localhost/x"));
+    }
+
+    #[test]
+    fn test_is_safe_auto_url_rejects_invalid_url() {
+        assert!(!is_safe_auto_url("not-a-url"));
+        assert!(!is_safe_auto_url(""));
+    }
+
+    #[test]
+    fn test_extract_article_rejects_non_http_scheme() {
+        // Build a client; the function should reject before any I/O.
+        let client = reqwest::blocking::Client::new();
+        let err = extract_article("file:///etc/passwd", &client, None).unwrap_err();
+        assert!(
+            err.to_string().contains("scheme") || err.to_string().contains("not allowed"),
+            "expected scheme rejection, got: {}",
+            err
+        );
+    }
+
+    // ── extract_article end-to-end tests against a local TcpListener stub ──
+    //
+    // These exercise the wrapping fetch path — Content-Length cap,
+    // Content-Type rejection, and the safe-redirect client's behavior when
+    // a 30x points into a private IP. The pure-Readability parsing path
+    // (extract_from_html) is already covered above; these close the gap on
+    // the network-side security gates.
+    //
+    // No external mock-server dependency: a one-shot TcpListener serves a
+    // single canned HTTP response and exits. Cheap, hermetic, deterministic.
+
+    use std::io::{Read as IoRead, Write as IoWrite};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Spawn a one-shot HTTP stub on 127.0.0.1 that writes `response_bytes`
+    /// verbatim to the first accepted client and closes. Returns the bound
+    /// URL. The stub thread is detached — the OS reclaims it after the test.
+    fn spawn_stub_server(response_bytes: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = listener.local_addr().expect("local_addr").port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read SOME of the request so the client doesn't get a
+                // RST while still writing headers. Single read is enough
+                // for a short GET; we don't actually inspect it.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response_bytes);
+                let _ = stream.flush();
+                // Dropping the stream signals connection close to the client.
+            }
+        });
+        format!("http://127.0.0.1:{}/", port)
+    }
+
+    #[test]
+    fn test_extract_article_rejects_oversized_content_length() {
+        // Server declares 100 MiB body — far past the 5 MiB cap. The
+        // pre-check on the Content-Length header must short-circuit the
+        // read entirely (no body actually streamed in this test).
+        let declared = FULLTEXT_MAX_BYTES * 20;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            declared
+        );
+        let url = spawn_stub_server(resp.into_bytes());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large"),
+            "expected oversized rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_rejects_non_html_content_type() {
+        let body = b"\x89PNG\r\n\x1a\nnotactuallyhtml";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: image/png\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        );
+        let mut bytes = resp.into_bytes();
+        bytes.extend_from_slice(body);
+        let url = spawn_stub_server(bytes);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not return HTML") || msg.contains("content-type"),
+            "expected content-type rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_rejects_redirect_into_private_ip_via_safe_client() {
+        // Stub returns a 302 pointing into RFC1918 space. The
+        // safe-redirect client's policy must refuse to follow — the
+        // resulting response surfaces as a non-2xx status, which
+        // extract_article translates into an "HTTP error" failure.
+        // (Without the safe client, reqwest would happily follow the 302
+        // and probe 192.168.1.1 — the SSRF this exists to prevent.)
+        let resp = b"HTTP/1.1 302 Found\r\n\
+                     Location: http://192.168.1.1/admin\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\
+                     \r\n";
+        let url = spawn_stub_server(resp.to_vec());
+        let client =
+            Feed::build_safe_redirect_client(5).expect("safe-redirect client should build");
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP error") || msg.contains("302"),
+            "expected non-2xx surfacing from refused redirect, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_follows_safe_redirect_to_public_target() {
+        // Sanity-check the other side of the redirect policy: a 302 to a
+        // public-looking target is followed. This stub returns 302 →
+        // http://example.invalid/ which the client WILL try to follow.
+        // The follow attempt will fail (example.invalid is unresolvable),
+        // but the failure must be a NETWORK error, NOT the policy-stop
+        // "HTTP error 302" surfacing from the refused-redirect path.
+        // That distinction is what tells us the policy correctly let the
+        // public target through.
+        let resp = b"HTTP/1.1 302 Found\r\n\
+                     Location: http://example.invalid/article\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\
+                     \r\n";
+        let url = spawn_stub_server(resp.to_vec());
+        let client =
+            Feed::build_safe_redirect_client(5).expect("safe-redirect client should build");
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        // Must NOT be "HTTP error 302" — that would mean the policy
+        // refused to follow a public target. Must be a fetch / dns / io
+        // failure from the actual follow attempt.
+        assert!(
+            !msg.contains("http error 302"),
+            "policy must follow public-target redirects, but surfaced 302: {}",
+            msg
+        );
+        assert!(
+            msg.contains("failed to fetch") || msg.contains("dns") || msg.contains("resolve"),
+            "expected a network failure from following the public redirect, got: {}",
+            msg
+        );
+    }
+
+    /// Like `spawn_stub_server`, but also captures the raw bytes of the
+    /// first request the stub receives and ships them back through an mpsc
+    /// channel. Lets a test assert on what `extract_article` actually puts
+    /// on the wire (headers, path, etc.) — vs. just what it returns.
+    fn spawn_capturing_stub_server(response_bytes: Vec<u8>) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // 8 KiB is plenty for a GET request with our headers; we
+                // only need enough to inspect the header block.
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                buf.truncate(n);
+                let _ = tx.send(buf);
+                let _ = stream.write_all(&response_bytes);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{}/", port), rx)
+    }
+
+    /// Regression lock for the "no per-feed Authorization on extraction" rule.
+    /// The function signature deliberately omits a headers parameter, but
+    /// nothing today fails loudly if a future refactor adds
+    /// `Authorization` to the static header list. This test inspects the
+    /// raw bytes on the wire and asserts that no `Authorization` header
+    /// is sent — third-party article hosts must not see per-feed bearer
+    /// tokens / cookies.
+    #[test]
+    fn test_extract_article_does_not_send_authorization_header() {
+        let body = fixture_article_html();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n{}",
+            body.len(),
+            body
+        );
+        let (url, captured) = spawn_capturing_stub_server(resp.into_bytes());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Outcome is irrelevant — we only care about what hit the wire.
+        let _ = extract_article(&url, &client, None);
+        let raw = captured
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stub must have captured a request");
+        let request = String::from_utf8_lossy(&raw);
+        // Header-name comparison is case-insensitive (RFC 7230 §3.2).
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            !lower.contains("\r\nauthorization:") && !lower.starts_with("authorization:"),
+            "extract_article must NOT forward an Authorization header — saw it in request:\n{}",
+            request
+        );
+        // Sanity: confirm we captured a real request, not just an empty read.
+        assert!(
+            lower.starts_with("get /"),
+            "expected a GET request, got: {}",
+            request
+        );
     }
 }

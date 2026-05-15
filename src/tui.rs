@@ -1,6 +1,6 @@
 use crate::app::{App, View};
 use crate::events::handle_events;
-use crate::feed::Feed;
+use crate::feed::{ExtractedArticle, Feed};
 use crate::ui;
 use anyhow::{Context, Result};
 use crossterm::{
@@ -13,9 +13,32 @@ use ratatui::{
     Terminal,
 };
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::{io, time::Duration};
+
+/// Hard cap on extraction worker threads in flight. The previous code spawned
+/// one thread per queued request unconditionally, which fanned out as 20+
+/// concurrent HTTP requests on a refresh of several `fulltext = true` feeds —
+/// often to the same host. A small pool plus per-domain throttling matches
+/// the politeness budget the feed-refresh path already uses.
+const EXTRACTION_MAX_INFLIGHT: usize = 4;
+
+/// Saturating decrement of the inflight counter — used by BOTH the worker's
+/// exit path and the watchdog. The watchdog releases a slot for any Pending
+/// it flips to `Failed("timed out")` so a truly dead worker can't leak
+/// budget for the rest of the session. If both paths fire for the same
+/// slot (slow worker the watchdog wrote off, then completed anyway), the
+/// saturating sub clamps at zero instead of underflowing to usize::MAX —
+/// which would effectively turn the bound into "spawn as many workers as
+/// you want until the heap runs out".
+fn release_inflight_slot(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+        Some(x.saturating_sub(1))
+    });
+}
 
 /// RAII guard that re-enters the alt-screen + raw mode + mouse capture on drop,
 /// so a panic during a pipe-to child invocation cannot leave the terminal in
@@ -201,36 +224,68 @@ fn drain_macro_steps<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
     }
 }
 
-/// Diff a freshly-arrived feed against `app.seen_items`, mutate the seen
-/// state in memory, and return the argv list to spawn for each genuinely-new
-/// item. On the first successful fetch of a feed (URL not yet in
-/// `feeds_seeded`), seed the seen set silently and return an empty list.
+/// Build the argv list to spawn for each genuinely-new item on this feed.
+/// `newly_seen` must come from `mark_feed_seen` — this helper consumes the
+/// pre-computed indices so multiple consumers (exec_on_new + fulltext) can
+/// share one `mark_feed_seen` call per feed arrival instead of double-marking.
 ///
 /// Returns Vec rather than spawning + saving inline so a refresh batch can
 /// `save_data` ONCE before spawning ANY child, instead of once per feed
 /// arrival (write amplification of N for N bookmarks). Crash semantics still
 /// AT-MOST-ONCE: see [`flush_exec_on_new`] for the persistence ordering.
 ///
-/// No-op when the hook is not configured. seen_items / feeds_seeded only
-/// exist to drive this hook, so users who never opt in pay neither the
-/// memory cost nor any save_data round-trip.
-fn collect_exec_on_new(app: &mut App, feed: &Feed) -> Vec<Vec<String>> {
+/// No-op when the hook is not configured.
+fn collect_exec_on_new(app: &App, feed: &Feed, newly_seen: &[usize]) -> Vec<Vec<String>> {
     let argv_template = match app.exec_on_new_template.as_ref() {
         Some(t) => t.clone(),
         None => return Vec::new(),
     };
-    let newly_seen_idx = crate::app::mark_feed_seen(app, feed);
-    if newly_seen_idx.is_empty() {
+    if newly_seen.is_empty() {
         return Vec::new();
     }
-    newly_seen_idx
-        .into_iter()
-        .filter_map(|idx| {
+    newly_seen
+        .iter()
+        .filter_map(|&idx| {
             let item = feed.items.get(idx)?;
             let ctx = crate::app::article_context_from(feed, item);
             Some(crate::app::expand_argv_template(&argv_template, &ctx))
         })
         .collect()
+}
+
+/// For feeds with `fulltext = true`, queue an extraction request for each
+/// newly-seen item. Uses the same newly-seen set as `exec_on_new` so an
+/// item is only auto-extracted once (and not on the first ever fetch of a
+/// feed — that one seeds the seen-set silently, matching the exec_on_new
+/// no-firehose contract).
+///
+/// Auto-mode applies a scheme + private-IP allowlist (`is_safe_auto_url`):
+/// the URL comes from feed XML, which a hostile feed could populate with
+/// `http://169.254.169.254/...` or other internal targets to trick the
+/// reader into probing the local network. Manual `Shift+F` is the user's
+/// explicit action and bypasses this gate.
+fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
+    if !app.fulltext_feeds.contains(&feed.url) {
+        return;
+    }
+    for &idx in newly_seen {
+        let Some(item) = feed.items.get(idx) else {
+            continue;
+        };
+        let Some(url) = item.link.as_deref() else {
+            continue;
+        };
+        if !crate::feed::is_safe_auto_url(url) {
+            continue;
+        }
+        let id = crate::app::make_item_id(feed, item);
+        // Auto path → use the safe-redirect client. The URL came from feed
+        // XML, so a hostile feed could publish a public-looking link that
+        // 302s to RFC1918 / metadata endpoints; revalidating each hop closes
+        // that window. Auto requests go to the back of the queue so an
+        // explicit user `Shift+F` is never starved behind a refresh batch.
+        app.request_extraction(id, url.to_string(), true, false);
+    }
 }
 
 /// Persist the updated seen-set, then spawn all collected exec_on_new
@@ -287,10 +342,191 @@ fn spawn_feed_refresh(app: &mut App) -> (usize, mpsc::Receiver<(usize, Result<Fe
     (pending_count, feed_rx)
 }
 
+/// Drain pending extraction requests up to the concurrency budget, applying
+/// per-domain throttling that matches the existing feed-refresh policy.
+/// Each spawned worker:
+///   * fetches the article URL with the existing reqwest blocking client
+///     (no per-feed auth headers — see `extract_article`)
+///   * runs Readability and posts the result back through `tx`
+///   * catches panics from `dom_smoothie` on hostile HTML and surfaces them
+///     as a `Failed` result so the slot doesn't strand on `Pending` forever
+///   * decrements `inflight` regardless of success / failure / panic, so the
+///     pool can't deadlock when a worker dies
+///
+/// Requests deferred for throttling or budget reasons stay on the queue;
+/// `run_app` calls this every loop iteration so they fire on the next tick.
+fn spawn_pending_extractions(
+    app: &mut App,
+    tx: &mpsc::Sender<(String, u64, Result<ExtractedArticle>)>,
+    inflight: &Arc<AtomicUsize>,
+    manual_client: &mut Option<reqwest::blocking::Client>,
+    safe_client: &mut Option<reqwest::blocking::Client>,
+) {
+    if app.pending_extraction_requests.is_empty() {
+        return;
+    }
+    let timeout = app.config.network.http_timeout;
+    let user_agent = app.config.network.user_agent.clone();
+    // `manual_client` / `safe_client` are owned by `run_app` so the
+    // `reqwest::blocking::Client`s are built at most once per session
+    // instead of once per tick that has work. Lazy build still: if the
+    // session never uses Shift+F we never construct the manual client,
+    // and vice versa.
+    let rate_limit = Duration::from_millis(app.config.general.refresh_rate_limit_delay);
+    let now = std::time::Instant::now();
+
+    // Pop only as many as the concurrency budget AND per-domain spacing
+    // allow. Anything we can't run right now gets pushed back to the front
+    // in original order so it retries next tick.
+    let mut deferred: Vec<crate::app::ExtractionRequest> = Vec::new();
+    loop {
+        // Relaxed is sufficient: the counter is just a bound on concurrent
+        // workers and doesn't synchronize any other memory. Result hand-off
+        // happens through the mpsc channel, which carries its own ordering.
+        let in_use = inflight.load(Ordering::Relaxed);
+        if in_use >= EXTRACTION_MAX_INFLIGHT {
+            break;
+        }
+        let Some(req) = app.pending_extraction_requests.pop_front() else {
+            break;
+        };
+        // Drop stale requests whose slot was evicted by LRU or removed
+        // because their feed was deleted — running them would burn an HTTP
+        // round-trip only to have `record_extraction_result` discard the
+        // outcome. Cheap monotonic-correctness gate; must come before the
+        // throttle defer so a stale id doesn't bounce back onto the queue.
+        // Match BOTH the Pending state and the request's generation —
+        // an evicted-and-recreated slot keeps the same id but gets a fresh
+        // generation, so a stale queued request must be discarded here.
+        match app.extracted.get(&req.id) {
+            Some(crate::app::ExtractionState::Pending { generation, .. })
+                if *generation == req.generation => {}
+            _ => continue,
+        }
+        let domain = App::extract_domain_from_url(&req.url);
+        let too_soon = !rate_limit.is_zero()
+            && app
+                .last_domain_fetch
+                .get(&domain)
+                .map(|last| now.duration_since(*last) < rate_limit)
+                .unwrap_or(false);
+        if too_soon {
+            deferred.push(req);
+            continue;
+        }
+        // Build (or reuse) the client that matches this request's redirect
+        // policy. A build failure here is permanent for this tick — re-queue
+        // the request and stop.
+        let client = if req.safe_redirects {
+            match safe_client {
+                Some(c) => c.clone(),
+                None => match Feed::build_safe_redirect_client(timeout) {
+                    Ok(c) => {
+                        *safe_client = Some(c.clone());
+                        c
+                    }
+                    Err(_) => {
+                        app.pending_extraction_requests.push_front(req);
+                        break;
+                    }
+                },
+            }
+        } else {
+            match manual_client {
+                Some(c) => c.clone(),
+                None => match Feed::build_client(timeout) {
+                    Ok(c) => {
+                        *manual_client = Some(c.clone());
+                        c
+                    }
+                    Err(_) => {
+                        app.pending_extraction_requests.push_front(req);
+                        break;
+                    }
+                },
+            }
+        };
+        // Claim the budget slot before spawning so a concurrent caller (or
+        // the very next loop iteration) sees the slot taken. We defer the
+        // `last_domain_fetch` stamp until AFTER `thread::Builder::spawn`
+        // returns Ok — a rare OS-level spawn failure should re-queue
+        // without burning an extra rate-limit window for the next attempt.
+        inflight.fetch_add(1, Ordering::Relaxed);
+        let ua = user_agent.clone();
+        let tx = tx.clone();
+        let inflight_for_worker = Arc::clone(inflight);
+        let req_id = req.id.clone();
+        let req_url = req.url.clone();
+        let req_generation = req.generation;
+        // `thread::Builder::spawn` returns `io::Result` instead of panicking
+        // on OS-level thread-creation failure (rare, but a panic from the
+        // main TUI loop would crash the app). On failure, release the slot
+        // and re-queue the request so the next tick retries.
+        let spawn_result = std::thread::Builder::new().spawn(move || {
+            // `extract_article` and (via dom_smoothie) Readability touch
+            // arbitrary HTML; a panic from the worker would otherwise leave
+            // the slot stuck on `Pending` for the rest of the session and
+            // there'd be no way for the user to retry.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                crate::feed::extract_article(&req_url, &client, Some(&ua))
+            }));
+            let result = match outcome {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "extraction worker panicked (hostile HTML?)"
+                )),
+            };
+            let _ = tx.send((req_id, req_generation, result));
+            release_inflight_slot(&inflight_for_worker);
+        });
+        if spawn_result.is_err() {
+            release_inflight_slot(inflight);
+            app.pending_extraction_requests.push_front(req);
+            break;
+        }
+        // Spawn succeeded — flip the slot's `spawned` flag so the watchdog
+        // knows this slot actually holds an inflight permit. Without this,
+        // a queue-stranded request (rate-limited beyond the watchdog
+        // window) would have its inflight slot "released" by the watchdog
+        // even though it never claimed one — silently widening the
+        // effective worker cap by one per spurious release.
+        app.mark_extraction_spawned(&req.id, req.generation);
+        // Stamp the domain so the next request for the same host respects
+        // the rate-limit. Done after spawn so a failed spawn doesn't leave
+        // a stale stamp behind.
+        if !domain.is_empty() {
+            app.last_domain_fetch.insert(domain, now);
+        }
+    }
+    // Re-enqueue throttled requests at the front, preserving their original
+    // FIFO order. Without `.rev()` we'd flip them.
+    for req in deferred.into_iter().rev() {
+        app.pending_extraction_requests.push_front(req);
+    }
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = Duration::from_millis(app.config.ui.tick_rate);
     let error_timeout = Duration::from_millis(app.config.ui.error_display_timeout);
+
+    // Long-lived channel for extraction worker completions. Outlives any
+    // individual refresh because manual `F` extractions can fire at any time.
+    // The `u64` is the request's generation tag, echoed back by the worker so
+    // `record_extraction_result` can drop late results from
+    // evicted-and-recreated slots.
+    let (extract_tx, extract_rx) = mpsc::channel::<(String, u64, Result<ExtractedArticle>)>();
+    // Bounds concurrent extraction workers. Each spawned worker bumps this
+    // on entry and drops it on exit (even on panic), so the pool never
+    // deadlocks even if `dom_smoothie` blows up on hostile HTML.
+    let extract_inflight = Arc::new(AtomicUsize::new(0));
+    // HTTP clients for extraction workers. Owned at the loop level (not
+    // rebuilt every call to `spawn_pending_extractions`) so a busy refresh
+    // doesn't churn `reqwest::blocking::Client` instances per tick.
+    // Lazy-built on first use of each path: a session that never hits
+    // `Shift+F` never constructs `extract_manual_client`, and vice versa.
+    let mut extract_manual_client: Option<reqwest::blocking::Client> = None;
+    let mut extract_safe_client: Option<reqwest::blocking::Client> = None;
 
     // Initial load of bookmarked feeds
     let (mut pending_count, mut feed_rx) = spawn_feed_refresh(app);
@@ -323,7 +559,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             let mut pending_exec: Vec<Vec<String>> = Vec::new();
             while let Ok((idx, result)) = feed_rx.try_recv() {
                 if let Ok(feed) = result {
-                    pending_exec.extend(collect_exec_on_new(app, &feed));
+                    // Compute newly-seen ONCE per feed arrival, shared
+                    // between exec_on_new and fulltext consumers. Skip the
+                    // mark entirely when neither consumer needs it — keeps
+                    // `seen_items` empty for users without hooks, matching
+                    // the original zero-cost contract.
+                    let needs_newly_seen = app.exec_on_new_template.is_some()
+                        || app.fulltext_feeds.contains(&feed.url);
+                    let newly_seen = if needs_newly_seen {
+                        crate::app::mark_feed_seen(app, &feed)
+                    } else {
+                        Vec::new()
+                    };
+                    pending_exec.extend(collect_exec_on_new(app, &feed, &newly_seen));
+                    enqueue_fulltext_for_new(app, &feed, &newly_seen);
                     // Insert at the correct position to maintain bookmark order,
                     // or append if earlier feeds haven't arrived yet
                     let insert_pos = app
@@ -380,6 +629,44 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         } else {
             tick_rate
         };
+
+        // Spawn workers for any extraction requests queued by events or
+        // by the feed-refresh path above. Run every iteration so manual
+        // `F` requests don't have to wait for a tick boundary.
+        spawn_pending_extractions(
+            app,
+            &extract_tx,
+            &extract_inflight,
+            &mut extract_manual_client,
+            &mut extract_safe_client,
+        );
+
+        // Drain completed extractions back into app state. This is what
+        // flips a `Pending` entry to `Ready` / `Failed`, which the detail
+        // view reads from on the next draw.
+        while let Ok((id, generation, result)) = extract_rx.try_recv() {
+            app.record_extraction_result(id, generation, result);
+        }
+
+        // Watchdog: flip any Pending slot older than `http_timeout * N` to
+        // `Failed("timed out")`. Cost ceiling per tick is bounded by
+        // EXTRACTED_CACHE_CAP (500) map reads — at the configured tick rate
+        // that's ~5k reads/sec worst case, negligible. Covers the rare case
+        // where a worker thread is killed externally (OOM, signal, SIGSEGV
+        // in a native dep) and never sends its result. `prune_*` returns
+        // the count of pruned slots that were actually *spawned* (held an
+        // inflight permit); queue-stranded prunes don't release inflight,
+        // so a long backlog can't shrink the effective pool. The matching
+        // saturating sub in the worker's exit path makes a spurious wake-up
+        // (worker actually still alive, finishes later) safe — at worst we
+        // transiently overcommit by up to `EXTRACTION_MAX_INFLIGHT` slots
+        // (every "released-but-still-alive" worker contributes one slot of
+        // over-commit until it actually exits), never underflow.
+        let pruned = app
+            .prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
+        for _ in 0..pruned {
+            release_inflight_slot(&extract_inflight);
+        }
 
         if event::poll(timeout)? {
             // Handle user input
@@ -486,6 +773,343 @@ mod tests {
         assert!(app.pending_macro_steps.is_empty());
         assert!(app.error.is_none());
         assert!(app.show_help_overlay);
+    }
+
+    #[test]
+    fn test_release_inflight_slot_saturates_at_zero() {
+        // The watchdog and worker-exit paths can race for the same slot.
+        // The saturating decrement must clamp at zero rather than wrapping
+        // to usize::MAX — otherwise the inflight bound is meaningless and
+        // the pool would spawn workers without limit.
+        let counter = AtomicUsize::new(0);
+        release_inflight_slot(&counter);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_release_inflight_slot_decrements_above_zero() {
+        let counter = AtomicUsize::new(3);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        release_inflight_slot(&counter);
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        // One more — must still clamp.
+        release_inflight_slot(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_prune_returns_count_so_caller_can_release_inflight() {
+        // Regression test for the inflight-leak fix: the watchdog must report
+        // how many slots it pruned so `run_app` can release that many inflight
+        // budget slots. Without the count, a chain of dead workers would
+        // saturate the pool for the rest of the session.
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        app.request_extraction(
+            "stuck1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        app.request_extraction(
+            "stuck2".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        // Forcibly age both Pending slots past the watchdog window AND
+        // mark them spawned=true so they represent real stuck workers
+        // (the case the watchdog's inflight-release is meant for).
+        let aged = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        for id in ["stuck1", "stuck2"] {
+            if let Some(ExtractionState::Pending { generation, .. }) = app.extracted.get(id) {
+                let gen = *generation;
+                app.extracted.insert(
+                    id.to_string(),
+                    ExtractionState::Pending {
+                        generation: gen,
+                        started_at: aged,
+                        spawned: true,
+                    },
+                );
+            }
+        }
+        let pruned = app.prune_stale_pending_extractions(Duration::from_secs(30));
+        assert_eq!(
+            pruned, 2,
+            "watchdog must report the spawned-pruned count for inflight release"
+        );
+    }
+
+    #[test]
+    fn test_record_extraction_result_flips_pending_to_ready() {
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // The request's generation is on the queued ExtractionRequest the
+        // worker would have spawned for. Echoing it back through
+        // `record_extraction_result` simulates the channel hand-off.
+        let gen = app.pending_extraction_requests[0].generation;
+        app.record_extraction_result(
+            "id1".to_string(),
+            gen,
+            Ok(ExtractedArticle {
+                title: "T".to_string(),
+                plain_text: "body".to_string(),
+                byline: None,
+                site_name: None,
+                source_url: "https://ex.com/a".to_string(),
+            }),
+        );
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    fn build_feed_with_items(url: &str, items: Vec<(&str, Option<&str>)>) -> Feed {
+        Feed {
+            url: url.to_string(),
+            title: "T".to_string(),
+            title_lower: "t".to_string(),
+            items: items
+                .into_iter()
+                .map(|(title, link)| crate::feed::FeedItem {
+                    title: title.to_string(),
+                    link: link.map(|s| s.to_string()),
+                    description: None,
+                    pub_date: None,
+                    author: None,
+                    formatted_date: None,
+                    parsed_date: None,
+                    plain_text: None,
+                    title_lower: title.to_lowercase(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_skips_when_feed_not_opted_in() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        // Not in fulltext_feeds → must be a no-op even with newly-seen indices.
+        enqueue_fulltext_for_new(&mut app, &feed, &[0]);
+        assert!(app.pending_extraction_requests.is_empty());
+        assert!(app.extracted.is_empty());
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_enqueues_safe_urls_with_safe_flag() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+        enqueue_fulltext_for_new(&mut app, &feed, &[0]);
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+        // Auto path must always tag the request safe_redirects=true so the
+        // worker picks the redirect-revalidating client.
+        assert!(app.pending_extraction_requests[0].safe_redirects);
+    }
+
+    /// Regression lock: `enqueue_fulltext_for_new` must short-circuit on
+    /// items that already have ANY extraction state (Ready / Failed /
+    /// Pending). The contract lives in `request_extraction`'s
+    /// `contains_key` guard, but it's load-bearing — without it, a refresh
+    /// would re-extract every Ready item on every cycle (burning bandwidth,
+    /// thrashing the LRU) and double-queue Pending items for in-flight
+    /// workers.
+    #[test]
+    fn test_enqueue_fulltext_for_new_short_circuits_on_existing_state() {
+        use crate::app::ExtractionState;
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("Cached-Ready", Some("https://ex.com/ready")),
+                ("Cached-Failed", Some("https://ex.com/failed")),
+                ("Cached-Pending", Some("https://ex.com/pending")),
+                ("Fresh", Some("https://ex.com/fresh")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+
+        let id_ready = crate::app::make_item_id(&feed, &feed.items[0]);
+        let id_failed = crate::app::make_item_id(&feed, &feed.items[1]);
+        let id_pending = crate::app::make_item_id(&feed, &feed.items[2]);
+
+        // Drive Ready: Pending → record_extraction_result(Ok).
+        app.request_extraction(
+            id_ready.clone(),
+            "https://ex.com/ready".to_string(),
+            true,
+            false,
+        );
+        let gen = match app.extracted.get(&id_ready) {
+            Some(ExtractionState::Pending { generation, .. }) => *generation,
+            other => panic!("expected Pending, got {:?}", other),
+        };
+        app.record_extraction_result(
+            id_ready,
+            gen,
+            Ok(ExtractedArticle {
+                title: "T".into(),
+                plain_text: "body".into(),
+                byline: None,
+                site_name: None,
+                source_url: "https://ex.com/ready".into(),
+            }),
+        );
+
+        // Drive Failed: Pending → record_extraction_result(Err).
+        app.request_extraction(
+            id_failed.clone(),
+            "https://ex.com/failed".to_string(),
+            true,
+            false,
+        );
+        let gen = match app.extracted.get(&id_failed) {
+            Some(ExtractionState::Pending { generation, .. }) => *generation,
+            other => panic!("expected Pending, got {:?}", other),
+        };
+        app.record_extraction_result(id_failed, gen, Err(anyhow::anyhow!("boom")));
+
+        // Drive Pending: just leave it.
+        app.request_extraction(
+            id_pending,
+            "https://ex.com/pending".to_string(),
+            true,
+            false,
+        );
+
+        // Clear the queue so we only observe what the next call adds.
+        app.pending_extraction_requests.clear();
+
+        // Re-observe ALL four items. Only the Fresh one should be queued —
+        // the other three already have state and must be skipped.
+        enqueue_fulltext_for_new(&mut app, &feed, &[0, 1, 2, 3]);
+
+        assert_eq!(
+            app.pending_extraction_requests.len(),
+            1,
+            "items with existing extraction state must not be re-queued"
+        );
+        assert_eq!(
+            app.pending_extraction_requests[0].url, "https://ex.com/fresh",
+            "only the fresh item should be queued"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_drops_unsafe_urls() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("Internal", Some("http://192.168.1.1/admin")),
+                ("Metadata", Some("http://169.254.169.254/")),
+                ("Bad scheme", Some("javascript:alert(1)")),
+                ("Localhost", Some("http://localhost/x")),
+                ("No link", None),
+                ("Public", Some("https://ex.com/a")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+        enqueue_fulltext_for_new(&mut app, &feed, &[0, 1, 2, 3, 4, 5]);
+        // Only the public https URL should make it through.
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+        assert_eq!(app.pending_extraction_requests[0].url, "https://ex.com/a");
+    }
+
+    /// Regression lock for the "single shared mark per feed arrival" contract.
+    /// `mark_feed_seen` must only be called ONCE per feed delivery, even when
+    /// both `exec_on_new` and `fulltext` are consuming the newly-seen set —
+    /// calling it twice would double-mark and the second consumer would see
+    /// an empty set. The fix lives at the `run_app` call site (gating on
+    /// `exec_on_new_template.is_some() || fulltext_feeds.contains(...)`) and
+    /// then handing the same `&[usize]` to both consumers.
+    #[test]
+    fn test_mark_feed_seen_shared_between_exec_on_new_and_fulltext() {
+        let mut app = App::new();
+        // Configure BOTH consumers for this feed.
+        app.exec_on_new_template = Some(vec!["echo".to_string(), "%t".to_string()]);
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("First", Some("https://ex.com/1")),
+                ("Second", Some("https://ex.com/2")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+
+        // Simulate the first refresh: feed is not yet seeded, so the first
+        // mark seeds silently and returns an empty newly-seen set.
+        let first_seen = crate::app::mark_feed_seen(&mut app, &feed);
+        assert!(
+            first_seen.is_empty(),
+            "first observation of a feed must seed silently"
+        );
+        // Both consumers see the same (empty) list — neither fires.
+        let exec = collect_exec_on_new(&app, &feed, &first_seen);
+        assert!(exec.is_empty(), "exec_on_new must not fire on first fetch");
+        enqueue_fulltext_for_new(&mut app, &feed, &first_seen);
+        assert!(
+            app.pending_extraction_requests.is_empty(),
+            "fulltext must not fire on first fetch"
+        );
+
+        // Second refresh delivers the SAME items + one new item. The single
+        // mark_feed_seen call MUST return only the new index, and both
+        // consumers fed the same slice MUST both observe it. A second
+        // mark_feed_seen call here would return [] (double-mark bug).
+        let feed2 = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("First", Some("https://ex.com/1")),
+                ("Second", Some("https://ex.com/2")),
+                ("Third", Some("https://ex.com/3")),
+            ],
+        );
+        let second_seen = crate::app::mark_feed_seen(&mut app, &feed2);
+        assert_eq!(
+            second_seen,
+            vec![2],
+            "only the genuinely-new item should be reported"
+        );
+        // A duplicate mark — the bug this whole regression test guards
+        // against — would now return an empty slice.
+        let dup = crate::app::mark_feed_seen(&mut app, &feed2);
+        assert!(
+            dup.is_empty(),
+            "calling mark_feed_seen twice for one arrival would starve the second consumer"
+        );
+
+        // The actual contract: both consumers fed the SAME `second_seen`
+        // slice must both react to the new item.
+        let exec = collect_exec_on_new(&app, &feed2, &second_seen);
+        assert_eq!(exec.len(), 1, "exec_on_new must fire for the new item");
+        enqueue_fulltext_for_new(&mut app, &feed2, &second_seen);
+        assert_eq!(
+            app.pending_extraction_requests.len(),
+            1,
+            "fulltext must enqueue for the new item from the same newly-seen slice"
+        );
+        assert_eq!(app.pending_extraction_requests[0].url, "https://ex.com/3");
     }
 
     #[test]

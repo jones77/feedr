@@ -162,6 +162,7 @@ pub(crate) fn dispatch_action(app: &mut App, action: KeyAction) {
             Err(e) => app.error = Some(format!("Failed to mark all read: {}", e)),
         },
         KeyAction::ExtractLinks => app.extract_links_from_current_item(),
+        KeyAction::FetchFullText => app.toggle_or_request_fulltext(),
         other => {
             app.error = Some(format!(
                 "macro: action '{}' not supported in macros",
@@ -840,6 +841,9 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                 }
                 _ if app.key_matches(KeyAction::Help, &key) => {
                     handle_show_help(app);
+                }
+                _ if app.key_matches(KeyAction::FetchFullText, &key) => {
+                    app.toggle_or_request_fulltext();
                 }
                 _ => {}
             },

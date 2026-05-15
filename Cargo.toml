@@ -34,6 +34,15 @@ toml = "0.8"
 scraper = "0.18"
 url = "2"
 shlex = "1.3"
+# dom_smoothie is pre-1.0 and is the security-critical HTML parsing surface
+# for the full-text extraction path. Cargo.lock is committed (so the actual
+# version pin is enforced there), and the default `"0.17"` (=caret) already
+# blocks 0.18+ on pre-1.0 crates. The explicit `~0.17` here is intent
+# signaling — it makes "patch-only updates allowed; major-version bumps
+# require manual review" obvious at the manifest level rather than only in
+# the lockfile.
+dom_smoothie = "~0.17"
+encoding_rs = "0.8"
 
 [profile.release]
 codegen-units = 1

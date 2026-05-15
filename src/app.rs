@@ -1,5 +1,5 @@
 use crate::config::{CompactMode, Config};
-use crate::feed::{Feed, FeedCategory, FeedItem};
+use crate::feed::{ExtractedArticle, Feed, FeedCategory, FeedItem};
 use crate::ui::ColorScheme;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -143,6 +143,38 @@ pub struct App {
     /// disabled or the template failed to tokenize at startup (in which case
     /// a startup warning is surfaced).
     pub exec_on_new_template: Option<Vec<String>>,
+    /// Per-item full-text extraction cache. Keyed by the same item_id scheme
+    /// as `read_items` / `starred_items`. In-memory only; not persisted.
+    pub extracted: HashMap<String, ExtractionState>,
+    /// Insertion order for `extracted`, used to drop the oldest entry when
+    /// the cache hits `EXTRACTED_CACHE_CAP`.
+    pub extracted_order: VecDeque<String>,
+    /// Feed URLs that have `fulltext = true` in config and should trigger
+    /// auto-extraction for newly-seen items on each refresh. Same derivation
+    /// pattern as `feed_headers` / `feed_refresh_intervals`.
+    pub fulltext_feeds: HashSet<String>,
+    /// When the focused article has a `Ready` extraction, this flag controls
+    /// whether the detail view renders the extracted text or the original
+    /// summary. Single global toggle (not per-item) — simplest UX and the
+    /// detail view only ever shows one article at a time.
+    pub show_extracted: bool,
+    /// `(feed_idx, item_idx)` of the article the detail view rendered last
+    /// frame. When the focus moves to a different article, `show_extracted`
+    /// is reset to `true` so the user doesn't carry over a "view summary"
+    /// toggle from one article to another (and end up staring at a summary
+    /// while the title bar labels the body `Full-text`). Only the detail
+    /// view writes to / consults this — other views resolve focus through
+    /// `current_article_indices` directly.
+    pub last_detail_focus: Option<(usize, usize)>,
+    /// Queue of extraction requests for the TUI loop to spawn worker threads
+    /// for. Decouples request-time (event handler) from spawn-time (loop
+    /// drain) so events.rs doesn't need the thread-handle / channel.
+    pub pending_extraction_requests: VecDeque<ExtractionRequest>,
+    /// Monotonic generation counter for extraction requests. Each new
+    /// `Pending` slot gets a fresh value so a worker for a previously
+    /// evicted-and-recreated slot can't accidentally satisfy the new
+    /// request — `record_extraction_result` matches the generation.
+    pub next_extraction_generation: u64,
 }
 
 /// Snapshot of the focused article passed to template-expansion / pipe-payload helpers.
@@ -190,6 +222,75 @@ pub enum AddFeedResult {
         page_url: String,
     },
 }
+
+/// State of a per-item full-text extraction. Lives only in-memory: a
+/// restart re-fetches on demand or via the next refresh for fulltext-flagged
+/// feeds. No on-disk persistence by design — saves us from cache-invalidation
+/// logic and bounds storage growth.
+#[derive(Clone, Debug)]
+pub enum ExtractionState {
+    /// In-flight. `generation` matches the generation stamped on the
+    /// `ExtractionRequest` that produced this slot; `started_at` drives the
+    /// stale-Pending watchdog. The generation closes a TOCTOU window where
+    /// a Pending slot is evicted from the LRU and re-requested for the same
+    /// id — without the tag, the old worker's eventual result would land on
+    /// the new slot.
+    ///
+    /// `spawned` flips to true only after the spawn loop has both bumped
+    /// the inflight counter AND successfully called `thread::Builder::spawn`.
+    /// A request that ages out while still queued (rate-limited behind a
+    /// backlog longer than the watchdog window) is `spawned == false`, and
+    /// the watchdog MUST NOT release an inflight slot for it — there was no
+    /// permit to release, and a spurious release would shrink the effective
+    /// pool below `EXTRACTION_MAX_INFLIGHT`.
+    Pending {
+        generation: u64,
+        started_at: Instant,
+        spawned: bool,
+    },
+    Ready(ExtractedArticle),
+    Failed(String),
+}
+
+/// A queued request for the TUI loop to spawn a worker thread for. Filled
+/// in `request_extraction_for_current` and `enqueue_auto_extractions`,
+/// drained in `tui.rs` each tick (same shape as `pending_macro_steps`).
+#[derive(Clone, Debug)]
+pub struct ExtractionRequest {
+    pub id: String,
+    pub url: String,
+    /// When true, the worker must use a client whose redirect policy re-runs
+    /// `is_safe_auto_url` on every hop. Set for the auto-fulltext path
+    /// (URLs come from feed XML, untrusted) and cleared for manual `Shift+F`
+    /// (user already chose the article — same trust model as opening it in
+    /// a browser).
+    pub safe_redirects: bool,
+    /// Generation tag matching the `Pending` slot this request was created
+    /// for. Worker echoes it back through the result channel so the receiver
+    /// can drop late results from stale (evicted-and-recreated) slots.
+    pub generation: u64,
+}
+
+/// Cap on the number of cached extracted articles. Auto-fetch over a big
+/// feed could otherwise accumulate state monotonically across a long
+/// session. Insertion-order LRU eviction (oldest cache entries are dropped
+/// first) — `extracted_order` tracks the insertion sequence.
+///
+/// Soft cap, not hard: `insert_extraction` refuses to evict
+/// `Pending { spawned: true }` slots — evicting one would hide it from the
+/// stale-Pending watchdog (which only looks at `extracted`) and leak the
+/// worker's inflight permit if the worker is dead. The number of such slots
+/// at any moment is bounded by the worker-pool size (see
+/// `EXTRACTION_MAX_INFLIGHT` in `tui.rs`), so the effective cap grows by at
+/// most that constant.
+pub const EXTRACTED_CACHE_CAP: usize = 500;
+
+/// Stale-`Pending` watchdog timeout, as a multiple of `http_timeout`. A worker
+/// whose Pending slot is older than `http_timeout * PENDING_WATCHDOG_MULTIPLIER`
+/// is assumed dead (OS kill / SIGSEGV in a native dep) and flipped to
+/// `Failed("timed out")` so the user can retry. Multiplier covers slow DNS,
+/// TLS handshakes, and Readability CPU time on top of the network timeout.
+pub const PENDING_WATCHDOG_MULTIPLIER: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct SavedData {
@@ -254,6 +355,14 @@ impl App {
             .default_feeds
             .iter()
             .filter_map(|f| f.refresh_interval.map(|interval| (f.url.clone(), interval)))
+            .collect();
+
+        // Build the set of URLs that opted into full-text auto-extraction
+        let fulltext_feeds: HashSet<String> = config
+            .default_feeds
+            .iter()
+            .filter(|f| f.fulltext.unwrap_or(false))
+            .map(|f| f.url.clone())
             .collect();
 
         // Parse last session time from saved data
@@ -351,6 +460,13 @@ impl App {
             feeds_seeded: saved_data.feeds_seeded,
             pending_macro_steps: VecDeque::new(),
             exec_on_new_template,
+            extracted: HashMap::new(),
+            extracted_order: VecDeque::new(),
+            fulltext_feeds,
+            show_extracted: true,
+            last_detail_focus: None,
+            pending_extraction_requests: VecDeque::new(),
+            next_extraction_generation: 0,
         };
 
         app.update_dashboard();
@@ -908,10 +1024,19 @@ impl App {
                 // feeds_seeded and its item IDs would stay in seen_items
                 // forever, growing the persisted JSON file monotonically.
                 self.feeds_seeded.remove(&url);
+                let mut removed_ids: Vec<String> = Vec::new();
                 for item in &self.feeds[idx].items {
                     let id = make_item_id(&self.feeds[idx], item);
                     self.seen_items.remove(&id);
+                    removed_ids.push(id);
                 }
+                // Drop in-memory extracted full-text for the removed items
+                // too — keeping them would never expire (no persistence)
+                // but they're keyed on item ids that no longer resolve.
+                for id in &removed_ids {
+                    self.remove_extraction(id);
+                }
+                self.fulltext_feeds.remove(&url);
 
                 // Remove from feeds
                 self.feeds.remove(idx);
@@ -1439,7 +1564,7 @@ impl App {
     }
 
     /// Extract domain from URL (e.g., "reddit.com" from "https://www.reddit.com/r/rust/.rss")
-    fn extract_domain_from_url(url: &str) -> String {
+    pub(crate) fn extract_domain_from_url(url: &str) -> String {
         // Simple domain extraction
         if let Some(domain_start) = url.find("://") {
             let after_protocol = &url[domain_start + 3..];
@@ -1694,6 +1819,302 @@ impl App {
         key: &crossterm::event::KeyEvent,
     ) -> Option<&crate::keybindings::MacroBinding> {
         self.macros.iter().find(|m| m.trigger.matches(key))
+    }
+
+    /// Look up extraction state for an item by its `(feed_idx, item_idx)`.
+    /// Returns `None` if the indices don't resolve or no extraction has been
+    /// requested for that item.
+    pub fn extraction_state_for(
+        &self,
+        feed_idx: usize,
+        item_idx: usize,
+    ) -> Option<&ExtractionState> {
+        let id = self.get_item_id(feed_idx, item_idx);
+        if id.is_empty() {
+            None
+        } else {
+            self.extracted.get(&id)
+        }
+    }
+
+    /// Land a worker result for `id`. Drops the result if the slot has been
+    /// evicted, removed (feed deleted), already taken to a non-Pending state,
+    /// or if the request's generation no longer matches the current Pending
+    /// slot — we never want to resurrect a dead cache entry or let a stale
+    /// worker satisfy a re-requested slot.
+    pub fn record_extraction_result(
+        &mut self,
+        id: String,
+        generation: u64,
+        result: Result<ExtractedArticle>,
+    ) {
+        if id.is_empty() {
+            return;
+        }
+        // Must be Pending AND the generation must match. The generation
+        // check closes the TOCTOU window where an LRU-evicted Pending slot
+        // gets re-requested: the old worker's result would otherwise land
+        // on the new Pending slot of the same id.
+        match self.extracted.get(&id) {
+            Some(ExtractionState::Pending { generation: g, .. }) if *g == generation => {}
+            _ => return,
+        }
+        let state = match result {
+            // `{:#}` flattens the anyhow cause chain into one line
+            // ("outer: caused by: inner"), preserving context that the
+            // default `{}` formatter drops. The user only ever sees the
+            // top message in the detail view, but a chained message helps
+            // when the failure is logged or reported.
+            Ok(article) => ExtractionState::Ready(article),
+            Err(e) => ExtractionState::Failed(format!("{:#}", e)),
+        };
+        self.insert_extraction(id, state);
+    }
+
+    /// Mark an item as `Pending` and append the request to the spawn queue.
+    /// No-op if the item already has any state (Pending / Ready / Failed) —
+    /// callers should clear or re-request explicitly. `safe_redirects` selects
+    /// whether the worker uses the safe-redirect client (auto path) or the
+    /// permissive one (manual path); see `ExtractionRequest::safe_redirects`.
+    /// `priority_front=true` jumps the queue: an explicit user click should
+    /// not wait behind a refresh's auto-extractions to the same host.
+    pub fn request_extraction(
+        &mut self,
+        id: String,
+        url: String,
+        safe_redirects: bool,
+        priority_front: bool,
+    ) {
+        if id.is_empty() || url.is_empty() {
+            return;
+        }
+        if self.extracted.contains_key(&id) {
+            return;
+        }
+        let generation = self.next_extraction_generation;
+        self.next_extraction_generation = self.next_extraction_generation.wrapping_add(1);
+        self.insert_extraction(
+            id.clone(),
+            ExtractionState::Pending {
+                generation,
+                started_at: Instant::now(),
+                spawned: false,
+            },
+        );
+        let req = ExtractionRequest {
+            id,
+            url,
+            safe_redirects,
+            generation,
+        };
+        if priority_front {
+            self.pending_extraction_requests.push_front(req);
+        } else {
+            self.pending_extraction_requests.push_back(req);
+        }
+    }
+
+    /// Sweep Pending slots that have been in-flight longer than
+    /// `http_timeout * PENDING_WATCHDOG_MULTIPLIER`, flip them to
+    /// `Failed("timed out")`, and return the count of pruned slots that
+    /// were actually *spawned* — so the caller can release exactly that
+    /// many inflight budget slots.
+    ///
+    /// A normally-completing worker (success, error, even a Rust panic caught
+    /// by `catch_unwind`) always sends a result back through the channel. A
+    /// worker that silently disappears — OS kill, SIGSEGV in a native dep,
+    /// parent thread crash — leaves its slot stuck on Pending forever, which
+    /// blocks `toggle_or_request_fulltext`'s `contains_key` guard. The
+    /// returned count is what `run_app` passes to a saturating decrement of
+    /// the shared `extract_inflight` counter so the pool doesn't leak budget
+    /// slots across a session.
+    ///
+    /// Critically, we only count pruned slots whose `spawned` flag is true:
+    /// a request that aged out while still queued never claimed an inflight
+    /// permit, so releasing one for it would silently widen the effective
+    /// worker cap. Both the watchdog path and the worker-exit path use
+    /// saturating decrement, so a slow worker that completes AFTER the
+    /// watchdog already released its slot can't underflow the counter.
+    pub fn prune_stale_pending_extractions(&mut self, http_timeout: std::time::Duration) -> usize {
+        let watchdog = http_timeout.saturating_mul(PENDING_WATCHDOG_MULTIPLIER);
+        if watchdog.is_zero() {
+            return 0;
+        }
+        let now = Instant::now();
+        let mut to_fail: Vec<(String, bool)> = Vec::new();
+        for (id, state) in self.extracted.iter() {
+            if let ExtractionState::Pending {
+                started_at,
+                spawned,
+                ..
+            } = state
+            {
+                if now.duration_since(*started_at) > watchdog {
+                    to_fail.push((id.clone(), *spawned));
+                }
+            }
+        }
+        let mut spawned_pruned = 0usize;
+        for (id, spawned) in to_fail {
+            if spawned {
+                spawned_pruned += 1;
+            }
+            // Mutate in place — must NOT route through `insert_extraction`,
+            // which promotes the entry to MRU. A watchdog-failed slot is
+            // strictly less useful than newer Ready entries, so it should
+            // keep its original LRU position and be evicted ahead of them.
+            if let Some(state) = self.extracted.get_mut(&id) {
+                *state = ExtractionState::Failed("timed out".to_string());
+            }
+        }
+        spawned_pruned
+    }
+
+    /// Mark a Pending slot as spawned (the spawn loop has bumped the inflight
+    /// counter and successfully called `thread::Builder::spawn`). Idempotent
+    /// — a no-op for any other state, so race conditions where the worker
+    /// already landed a result before this is called are harmless.
+    pub(crate) fn mark_extraction_spawned(&mut self, id: &str, generation: u64) {
+        if let Some(ExtractionState::Pending {
+            generation: g,
+            spawned,
+            ..
+        }) = self.extracted.get_mut(id)
+        {
+            if *g == generation {
+                *spawned = true;
+            }
+        }
+    }
+
+    /// Forget a single extraction slot (both the state and its LRU
+    /// position). The deque is kept in sync with the map.
+    pub(crate) fn remove_extraction(&mut self, id: &str) {
+        self.extracted.remove(id);
+        if let Some(pos) = self.extracted_order.iter().position(|x| x.as_str() == id) {
+            self.extracted_order.remove(pos);
+        }
+    }
+
+    fn insert_extraction(&mut self, id: String, state: ExtractionState) {
+        // If id is already present, move its LRU position to most-recent and
+        // overwrite the state.
+        if let Some(existing) = self.extracted.get_mut(&id) {
+            *existing = state;
+            if let Some(pos) = self.extracted_order.iter().position(|x| x == &id) {
+                self.extracted_order.remove(pos);
+            }
+            self.extracted_order.push_back(id);
+            return;
+        }
+        // LRU eviction with a soft-protect for `Pending { spawned: true }`
+        // slots. Evicting a spawned Pending would hide the slot from the
+        // stale-Pending watchdog (it iterates `extracted`), leaving a dead
+        // worker's inflight permit leaked for the rest of the session.
+        // Skip those slots and evict the next-oldest evictable entry.
+        //
+        // The protected-slot count is bounded by the worker pool (see
+        // `EXTRACTION_MAX_INFLIGHT` in `tui.rs`), so the cache size is
+        // bounded at `EXTRACTED_CACHE_CAP + EXTRACTION_MAX_INFLIGHT` — a
+        // soft cap, not hard, but still strictly bounded. If every entry
+        // happens to be a spawned Pending (would mean the entire pool has
+        // been stuck for a long time), the cache transiently grows past
+        // CAP; the watchdog will eventually flip those slots to Failed,
+        // restoring evictability on the next insert.
+        while self.extracted_order.len() >= EXTRACTED_CACHE_CAP {
+            let evict_idx = self.extracted_order.iter().position(|id| {
+                !matches!(
+                    self.extracted.get(id),
+                    Some(ExtractionState::Pending { spawned: true, .. })
+                )
+            });
+            match evict_idx {
+                Some(idx) => {
+                    // `VecDeque::remove` is O(N) for arbitrary indices,
+                    // but N ≤ ~500 and eviction only fires at the cap.
+                    if let Some(evict) = self.extracted_order.remove(idx) {
+                        self.extracted.remove(&evict);
+                    }
+                }
+                None => break,
+            }
+        }
+        self.extracted.insert(id.clone(), state);
+        self.extracted_order.push_back(id);
+    }
+
+    /// Handler for the FetchFullText keybinding. Resolves the focused
+    /// article, then either toggles the view (if extraction is Ready) or
+    /// queues a new extraction request. Re-queues on `Failed` so the user
+    /// can retry. No-op on `Pending` (extraction already in flight).
+    pub fn toggle_or_request_fulltext(&mut self) {
+        let Some((feed_idx, item_idx)) = self.current_article_indices() else {
+            self.error = Some("No article in focus".to_string());
+            return;
+        };
+        let id = self.get_item_id(feed_idx, item_idx);
+        if id.is_empty() {
+            self.error = Some("No article in focus".to_string());
+            return;
+        }
+        let url = match self
+            .feeds
+            .get(feed_idx)
+            .and_then(|f| f.items.get(item_idx))
+            .and_then(|i| i.link.clone())
+        {
+            Some(u) => u,
+            None => {
+                self.error = Some("Article has no URL".to_string());
+                return;
+            }
+        };
+        // Track whether this invocation actually queued / unqueued a
+        // request so we only show the off-view hint when something happened.
+        let mut queued_or_toggled = false;
+        match self.extracted.get(&id) {
+            Some(ExtractionState::Ready(_)) => {
+                self.show_extracted = !self.show_extracted;
+                queued_or_toggled = true;
+            }
+            Some(ExtractionState::Pending { .. }) => {
+                // already in flight — leave it
+            }
+            Some(ExtractionState::Failed(_)) => {
+                self.remove_extraction(&id);
+                self.show_extracted = true;
+                // Manual retry: jump the queue ahead of any auto-extractions
+                // a refresh may have enqueued.
+                self.request_extraction(id, url, false, true);
+                queued_or_toggled = true;
+            }
+            None => {
+                self.show_extracted = true;
+                // Manual request: priority over auto-path enqueues.
+                self.request_extraction(id, url, false, true);
+                queued_or_toggled = true;
+            }
+        }
+        // The detail view is what renders extracted state; when the action
+        // fires from anywhere else (macro path on Dashboard / FeedItems /
+        // Starred) the user gets no visible feedback. Surface a hint so the
+        // request doesn't feel like a no-op.
+        if queued_or_toggled && self.view != View::FeedItemDetail {
+            self.success_message = Some("Extracting full text (open article to view)".to_string());
+            self.success_message_time = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Called from the detail renderer each frame. If the focused article
+    /// changed since the last frame, reset the global `show_extracted`
+    /// toggle to `true` so the user doesn't carry a "view summary" choice
+    /// from one article to another. Idempotent on unchanged focus.
+    pub fn sync_detail_focus_anchor(&mut self) {
+        let current_focus = self.current_article_indices();
+        if self.last_detail_focus != current_focus {
+            self.show_extracted = true;
+            self.last_detail_focus = current_focus;
+        }
     }
 }
 
@@ -2586,5 +3007,675 @@ mod tests {
         );
         assert!(parsed.seen_items.is_empty());
         assert!(parsed.feeds_seeded.is_empty());
+    }
+
+    fn dummy_extracted(text: &str) -> ExtractedArticle {
+        ExtractedArticle {
+            title: "T".to_string(),
+            plain_text: text.to_string(),
+            byline: None,
+            site_name: None,
+            source_url: "https://ex.com/a".to_string(),
+        }
+    }
+
+    /// Look up the generation stamped on a `Pending` slot, so tests can
+    /// echo it back through `record_extraction_result` the same way a
+    /// real worker would.
+    fn pending_generation(app: &App, id: &str) -> u64 {
+        match app.extracted.get(id) {
+            Some(ExtractionState::Pending { generation, .. }) => *generation,
+            other => panic!("expected Pending slot for {}, got {:?}", id, other),
+        }
+    }
+
+    #[test]
+    fn test_request_extraction_creates_pending_and_enqueues() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { .. })
+        ));
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_request_extraction_stores_safe_redirects_flag() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id_auto".to_string(),
+            "https://ex.com/a".to_string(),
+            true,
+            false,
+        );
+        app.request_extraction(
+            "id_manual".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        let q: Vec<_> = app.pending_extraction_requests.iter().collect();
+        let auto = q.iter().find(|r| r.id == "id_auto").unwrap();
+        let manual = q.iter().find(|r| r.id == "id_manual").unwrap();
+        assert!(
+            auto.safe_redirects,
+            "auto-path request must carry safe_redirects=true"
+        );
+        assert!(
+            !manual.safe_redirects,
+            "manual-path request must carry safe_redirects=false"
+        );
+    }
+
+    #[test]
+    fn test_request_extraction_priority_front_jumps_queue() {
+        // Auto requests go to the back; a manual (`priority_front=true`)
+        // request must land at the head so an explicit Shift+F isn't
+        // starved behind a refresh's auto-extraction batch.
+        let mut app = App::new();
+        for i in 0..3 {
+            app.request_extraction(
+                format!("auto{}", i),
+                "https://ex.com/a".to_string(),
+                true,
+                false,
+            );
+        }
+        app.request_extraction(
+            "manual".to_string(),
+            "https://ex.com/m".to_string(),
+            false,
+            true,
+        );
+        let order: Vec<&str> = app
+            .pending_extraction_requests
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["manual", "auto0", "auto1", "auto2"],
+            "manual request must jump to the front"
+        );
+    }
+
+    #[test]
+    fn test_request_extraction_idempotent_for_already_pending() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // No double-queue: second call must be a no-op because state is Pending.
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_record_extraction_result_transitions_to_ready() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        app.record_extraction_result("id1".to_string(), gen, Ok(dummy_extracted("body")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_record_extraction_result_transitions_to_failed() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        app.record_extraction_result("id1".to_string(), gen, Err(anyhow::anyhow!("boom")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Failed(msg)) => assert!(msg.contains("boom")),
+            other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lru_evicts_oldest_at_cap() {
+        let mut app = App::new();
+        // Insert one more than the cap; the first id must be evicted. Real
+        // callers always Pending → Ready, and `record_extraction_result`
+        // refuses results for slots without a Pending predecessor, so do the
+        // same here.
+        for i in 0..EXTRACTED_CACHE_CAP + 1 {
+            let id = format!("id{}", i);
+            app.request_extraction(id.clone(), "https://ex.com/a".to_string(), false, false);
+            let gen = pending_generation(&app, &id);
+            app.record_extraction_result(id, gen, Ok(dummy_extracted("x")));
+        }
+        assert!(!app.extracted.contains_key("id0"), "oldest must be evicted");
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    #[test]
+    fn test_remove_current_feed_prunes_extracted_cache() {
+        let mut app = make_test_app();
+        // Seed extraction state for items in the first feed via the real
+        // request → result transition.
+        let id_old = app.get_item_id(0, 0);
+        let id_new = app.get_item_id(0, 1);
+        app.request_extraction(id_old.clone(), "https://ex.com/a".to_string(), false, false);
+        let gen_old = pending_generation(&app, &id_old);
+        app.record_extraction_result(id_old.clone(), gen_old, Ok(dummy_extracted("a")));
+        app.request_extraction(id_new.clone(), "https://ex.com/b".to_string(), false, false);
+        let gen_new = pending_generation(&app, &id_new);
+        app.record_extraction_result(id_new.clone(), gen_new, Ok(dummy_extracted("b")));
+        assert_eq!(app.extracted.len(), 2);
+
+        // Remove the first feed.
+        app.selected_feed = Some(0);
+        app.remove_current_feed().ok();
+
+        assert!(
+            !app.extracted.contains_key(&id_old) && !app.extracted.contains_key(&id_new),
+            "extracted entries for removed feed must be pruned"
+        );
+        assert!(
+            app.extracted_order.is_empty(),
+            "LRU order must be pruned in sync with the map"
+        );
+    }
+
+    #[test]
+    fn test_record_extraction_result_drops_late_result_for_evicted_id() {
+        // Simulates the race where a worker thread completes after its slot
+        // was evicted (or its feed was removed). We must not resurrect the
+        // slot — otherwise dead state pins memory and confuses the UI.
+        let mut app = App::new();
+        // Any generation — slot doesn't exist, so result is dropped before
+        // generation is even consulted.
+        app.record_extraction_result("ghost".to_string(), 0, Ok(dummy_extracted("body")));
+        assert!(
+            !app.extracted.contains_key("ghost"),
+            "result for an id with no Pending slot must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_record_extraction_result_drops_late_result_for_ready_slot() {
+        // If the slot is already `Ready` (e.g. user manually retried and the
+        // retry landed first), a second late worker must not clobber it.
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        app.record_extraction_result("id1".to_string(), gen, Ok(dummy_extracted("first")));
+        // Late second worker — slot is Ready, so this must be a no-op.
+        // Whatever generation it claims is irrelevant; the state check fails.
+        app.record_extraction_result("id1".to_string(), gen, Ok(dummy_extracted("late")));
+        match app.extracted.get("id1") {
+            Some(ExtractionState::Ready(a)) => {
+                assert_eq!(a.plain_text, "first", "late result must not clobber Ready")
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_record_extraction_result_drops_stale_generation_on_re_requested_slot() {
+        // The TOCTOU race the generation tag closes: a Pending slot is
+        // evicted by LRU, then re-requested for the same id. The OLD
+        // worker (still running) eventually delivers its result. Without
+        // the generation check, that stale result would land on the new
+        // Pending slot — silently satisfying a "manual retry" with a
+        // stale fetch.
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let stale_gen = pending_generation(&app, "id1");
+        // Evict + re-request manually (faster than filling 500 entries).
+        app.remove_extraction("id1");
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let fresh_gen = pending_generation(&app, "id1");
+        assert_ne!(
+            stale_gen, fresh_gen,
+            "re-requested slot must carry a fresh generation"
+        );
+        // Old worker lands a result tagged with the stale generation.
+        app.record_extraction_result("id1".to_string(), stale_gen, Ok(dummy_extracted("stale")));
+        // Slot must still be Pending — the stale result was discarded.
+        assert!(
+            matches!(
+                app.extracted.get("id1"),
+                Some(ExtractionState::Pending { generation: g, .. }) if *g == fresh_gen
+            ),
+            "stale-generation result must not satisfy the re-requested slot"
+        );
+    }
+
+    #[test]
+    fn test_prune_stale_pending_extractions_flips_old_pending_to_failed() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // Forcibly age the Pending slot's started_at past the watchdog.
+        // Mark it `spawned=true` so this test exercises the genuine
+        // stuck-worker case (a worker that bumped inflight and never
+        // released it) — that's what the watchdog is meant to recover.
+        let id = "id1".to_string();
+        let gen = pending_generation(&app, &id);
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable on a freshly-booted machine");
+        app.extracted.insert(
+            id.clone(),
+            ExtractionState::Pending {
+                generation: gen,
+                started_at: aged,
+                spawned: true,
+            },
+        );
+        // 30 s × 3 = 90 s watchdog; aged 3600 s exceeds it.
+        app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        match app.extracted.get(&id) {
+            Some(ExtractionState::Failed(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected timeout reason: {}",
+                    msg
+                )
+            }
+            other => panic!("expected Failed after watchdog, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_prune_returns_zero_for_aged_but_unspawned_pending() {
+        // Regression test for the inflight-counter drift: a request that
+        // aged out while still queued (rate-limited behind a long backlog)
+        // has `spawned=false`, so the watchdog must NOT count it toward the
+        // inflight-release total. Counting it would silently widen the
+        // effective worker cap because no permit was ever claimed.
+        let mut app = App::new();
+        app.request_extraction(
+            "stranded".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "stranded");
+        // Age the slot but leave `spawned=false` — the request never made
+        // it through the spawn loop.
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        app.extracted.insert(
+            "stranded".to_string(),
+            ExtractionState::Pending {
+                generation: gen,
+                started_at: aged,
+                spawned: false,
+            },
+        );
+        let pruned = app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        assert_eq!(
+            pruned, 0,
+            "watchdog must return zero for queue-stranded prunes — no inflight permit was ever claimed"
+        );
+        // The slot still flips to Failed so the user can retry; only the
+        // inflight-release count is gated on `spawned`.
+        assert!(
+            matches!(
+                app.extracted.get("stranded"),
+                Some(ExtractionState::Failed(_))
+            ),
+            "queue-stranded slot must still be flipped to Failed so a manual retry works"
+        );
+    }
+
+    #[test]
+    fn test_prune_counts_only_spawned_slots_when_mixed() {
+        // Mixed batch: one spawned (real stuck worker) and one queue-stranded.
+        // Only the spawned one should be counted toward inflight release.
+        let mut app = App::new();
+        app.request_extraction(
+            "spawned".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        app.request_extraction(
+            "queued".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        let g1 = pending_generation(&app, "spawned");
+        let g2 = pending_generation(&app, "queued");
+        app.extracted.insert(
+            "spawned".to_string(),
+            ExtractionState::Pending {
+                generation: g1,
+                started_at: aged,
+                spawned: true,
+            },
+        );
+        app.extracted.insert(
+            "queued".to_string(),
+            ExtractionState::Pending {
+                generation: g2,
+                started_at: aged,
+                spawned: false,
+            },
+        );
+        let pruned = app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        assert_eq!(pruned, 1, "only the spawned slot must be counted");
+    }
+
+    #[test]
+    fn test_mark_extraction_spawned_flips_flag_on_matching_generation() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        // Before: spawned=false from request_extraction.
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: false, .. })
+        ));
+        app.mark_extraction_spawned("id1", gen);
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: true, .. })
+        ));
+    }
+
+    #[test]
+    fn test_mark_extraction_spawned_is_noop_on_generation_mismatch() {
+        // If the slot was evicted and re-requested between spawn() and
+        // mark_extraction_spawned, the old generation must not flip the
+        // flag on the fresh slot. The stale worker's record_extraction_result
+        // would also be dropped by the generation check, so leaving
+        // spawned=false on the fresh slot is the right semantic.
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let stale_gen = pending_generation(&app, "id1");
+        app.remove_extraction("id1");
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let fresh_gen = pending_generation(&app, "id1");
+        assert_ne!(stale_gen, fresh_gen);
+        app.mark_extraction_spawned("id1", stale_gen);
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: false, .. })
+        ));
+    }
+
+    #[test]
+    fn test_prune_stale_pending_extractions_leaves_fresh_pending_alone() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // Freshly Pending — well within the watchdog window.
+        app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { .. })
+        ));
+    }
+
+    #[test]
+    fn test_lru_hard_cap_when_oldest_is_pending() {
+        // Stress the soft-cap edge case: queue CAP+1 requests as Pending
+        // (no result returned). The cache size must stay at the cap, not
+        // grow with the number of in-flight requests.
+        let mut app = App::new();
+        for i in 0..EXTRACTED_CACHE_CAP + 5 {
+            let id = format!("id{}", i);
+            app.request_extraction(id, "https://ex.com/a".to_string(), false, false);
+        }
+        assert_eq!(
+            app.extracted.len(),
+            EXTRACTED_CACHE_CAP,
+            "Pending entries must not let the cache exceed the hard cap"
+        );
+        assert_eq!(app.extracted_order.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    #[test]
+    fn test_remove_extraction_helper_prunes_both_map_and_order() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        app.record_extraction_result("id1".to_string(), gen, Ok(dummy_extracted("body")));
+        assert_eq!(app.extracted.len(), 1);
+        assert_eq!(app.extracted_order.len(), 1);
+        app.remove_extraction("id1");
+        assert!(app.extracted.is_empty());
+        assert!(app.extracted_order.is_empty());
+    }
+
+    #[test]
+    fn test_sync_detail_focus_anchor_resets_show_extracted_on_focus_change() {
+        // Regression test for the cross-article show_extracted bug: the
+        // global toggle must reset to `true` whenever the detail view's
+        // focused article changes, so a "view summary" choice on article A
+        // doesn't silently carry over to article B.
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        // First sync — establishes the anchor at (0, 0).
+        app.sync_detail_focus_anchor();
+        assert!(app.show_extracted);
+        assert_eq!(app.last_detail_focus, Some((0, 0)));
+
+        // Simulate the user pressing Shift+F to toggle off on article (0, 0).
+        app.show_extracted = false;
+        // Re-sync on the same article — must NOT clobber the user's toggle.
+        app.sync_detail_focus_anchor();
+        assert!(
+            !app.show_extracted,
+            "anchor unchanged → user's toggle preserved"
+        );
+
+        // User navigates to article (0, 1). Sync must reset the toggle.
+        app.selected_item = Some(1);
+        app.sync_detail_focus_anchor();
+        assert!(
+            app.show_extracted,
+            "focus changed → show_extracted must reset to true"
+        );
+        assert_eq!(app.last_detail_focus, Some((0, 1)));
+    }
+
+    #[test]
+    fn test_sync_detail_focus_anchor_is_noop_when_focus_unchanged() {
+        // Per-frame call must be idempotent — otherwise a toggled-off state
+        // would be wiped on the very next frame and the toggle would feel
+        // unresponsive.
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        app.sync_detail_focus_anchor();
+        app.show_extracted = false;
+        for _ in 0..10 {
+            app.sync_detail_focus_anchor();
+        }
+        assert!(
+            !app.show_extracted,
+            "repeated syncs must not wipe the toggle"
+        );
+    }
+
+    /// Regression lock for the LRU-vs-watchdog leak: evicting a Pending slot
+    /// whose `spawned` flag is true would hide it from
+    /// `prune_stale_pending_extractions` (which only iterates `extracted`),
+    /// so a silently-dead worker's inflight permit would leak for the rest
+    /// of the session. `insert_extraction` must skip such slots during
+    /// eviction and evict the next-oldest evictable entry.
+    #[test]
+    fn test_lru_eviction_skips_spawned_pending_slots() {
+        let mut app = App::new();
+        // Seed one spawned-Pending slot at the head of the LRU. Real callers
+        // would have inserted via `request_extraction` then flipped `spawned`
+        // via `mark_extraction_spawned`; we do the same here.
+        app.request_extraction(
+            "spawned_head".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "spawned_head");
+        app.mark_extraction_spawned("spawned_head", gen);
+        // Fill the rest of the cap with Ready entries (insertion-order LRU
+        // puts them all behind the spawned head).
+        for i in 0..EXTRACTED_CACHE_CAP - 1 {
+            let id = format!("ready{}", i);
+            app.request_extraction(id.clone(), "https://ex.com/x".to_string(), false, false);
+            let g = pending_generation(&app, &id);
+            app.record_extraction_result(id, g, Ok(dummy_extracted("body")));
+        }
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+
+        // Insert one more entry — eviction must skip the spawned-Pending
+        // head and instead evict the next-oldest (ready0).
+        app.request_extraction(
+            "newcomer".to_string(),
+            "https://ex.com/n".to_string(),
+            false,
+            false,
+        );
+        let g = pending_generation(&app, "newcomer");
+        app.record_extraction_result("newcomer".to_string(), g, Ok(dummy_extracted("body")));
+
+        assert!(
+            app.extracted.contains_key("spawned_head"),
+            "spawned-Pending slot must NOT be evicted — would hide it from the watchdog"
+        );
+        assert!(
+            !app.extracted.contains_key("ready0"),
+            "the next-oldest evictable entry should have been evicted instead"
+        );
+        // Size still bounded — cap +/- the one we skipped (no extra growth
+        // here because we only protected one slot and evicted one entry).
+        assert_eq!(app.extracted.len(), EXTRACTED_CACHE_CAP);
+    }
+
+    /// Watchdog must NOT promote a stale Pending → Failed transition to the
+    /// most-recently-used end of the LRU deque. A timed-out entry should be
+    /// strictly less useful than newer Ready entries and evicted ahead of
+    /// them — promoting it would invert that order.
+    #[test]
+    fn test_watchdog_failure_does_not_promote_lru_position() {
+        let mut app = App::new();
+        app.request_extraction(
+            "first".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        // Insert another entry so we can observe LRU order before/after.
+        app.request_extraction(
+            "second".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        // Order should be [first, second] in the deque.
+        let order_before: Vec<String> = app.extracted_order.iter().cloned().collect();
+        assert_eq!(
+            order_before,
+            vec!["first".to_string(), "second".to_string()]
+        );
+
+        // Age `first` past the watchdog window and run the prune.
+        let gen = pending_generation(&app, "first");
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        app.extracted.insert(
+            "first".to_string(),
+            ExtractionState::Pending {
+                generation: gen,
+                started_at: aged,
+                spawned: true,
+            },
+        );
+        app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+
+        // State flipped to Failed, but LRU position preserved at the head.
+        assert!(matches!(
+            app.extracted.get("first"),
+            Some(ExtractionState::Failed(_))
+        ));
+        let order_after: Vec<String> = app.extracted_order.iter().cloned().collect();
+        assert_eq!(
+            order_after,
+            vec!["first".to_string(), "second".to_string()],
+            "watchdog must NOT promote a Failed entry to MRU — would let it outlive newer Ready slots"
+        );
     }
 }

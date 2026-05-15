@@ -129,6 +129,10 @@ pub struct DefaultFeed {
     /// Per-feed refresh interval in seconds; None = use global interval
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval: Option<u64>,
+    /// When true, auto-extract full-text for newly-seen items from this feed
+    /// on each refresh. Manual extraction via Shift+F always works regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulltext: Option<bool>,
 }
 
 // Default value functions
@@ -406,6 +410,15 @@ impl Config {
              # [default_feeds.headers]\n\
              # Authorization = \"Bearer your_token_here\"\n\
              #\n\
+             # Full-text extraction (Readability) — auto-extract on refresh:\n\
+             # [[default_feeds]]\n\
+             # url = \"https://example.com/summary-only-feed.xml\"\n\
+             # fulltext = true\n\
+             #\n\
+             # Press Shift+F in the article detail view to extract on-demand\n\
+             # for any feed. Auth headers from this feed are NOT sent to the\n\
+             # article URL — they would leak to third-party hosts.\n\
+             #\n\
              # ── External-command hooks ──────────────────────────────\n\
              #\n\
              # Macros bind a key (invoked as <prefix><key>, default prefix is ',') to\n\
@@ -419,7 +432,7 @@ impl Config {
              #\n\
              # Supported actions inside macros:\n\
              #   open-in-browser, toggle-star, toggle-read, mark-all-read,\n\
-             #   refresh, toggle-theme, extract-links, help\n\
+             #   refresh, toggle-theme, extract-links, fetch-full-text, help\n\
              # Other keybinding actions are intentionally not callable from macros.\n\
              #\n\
              # Variables expanded per argv token:\n\
@@ -472,6 +485,34 @@ mod tests {
         assert_eq!(config.network.http_timeout, 15);
         assert_eq!(config.ui.tick_rate, 100);
         assert_eq!(config.ui.error_display_timeout, 3000);
+    }
+
+    #[test]
+    fn test_default_feed_without_fulltext_parses() {
+        // Existing configs that have no `fulltext` key must keep working.
+        let toml_str = r#"
+            [[default_feeds]]
+            url = "https://example.com/feed.xml"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_feeds.len(), 1);
+        assert!(config.default_feeds[0].fulltext.is_none());
+    }
+
+    #[test]
+    fn test_default_feed_with_fulltext_round_trips() {
+        let toml_str = r#"
+            [[default_feeds]]
+            url = "https://example.com/feed.xml"
+            fulltext = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_feeds[0].fulltext, Some(true));
+
+        // Round-trip: serialize the parsed config and parse the result.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.default_feeds[0].fulltext, Some(true));
     }
 
     #[test]

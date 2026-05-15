@@ -361,6 +361,7 @@ impl ConfigEditor {
             category,
             headers: None,
             refresh_interval: None,
+            fulltext: None,
         });
         self.dirty = true;
         self.adding_feed = false;

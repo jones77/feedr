@@ -1,4 +1,5 @@
-use crate::app::App;
+use crate::app::{App, ExtractionState};
+use crate::keybindings::{key_display, KeyAction};
 use crate::ui::utils::{count_wrapped_lines, format_content_for_reading, truncate_url};
 use crate::ui::ColorScheme;
 use html2text::from_read;
@@ -11,12 +12,29 @@ use ratatui::{
     Frame,
 };
 
+/// Which body the detail view is currently showing. Owns its strings so
+/// the immutable borrow on `app.extracted` is released before we call any
+/// `&mut App` method later in the render (e.g. `update_detail_max_scroll`).
+enum BodySource {
+    Summary,
+    Extracted(String),
+    Extracting,
+    /// Failed extraction — body falls back to the summary, and `reason` is
+    /// shown as a small dim hint above it.
+    Failed(String),
+}
+
 pub(super) fn render_item_detail<B: Backend>(
     f: &mut Frame<B>,
     app: &mut App,
     area: Rect,
     colors: &ColorScheme,
 ) {
+    // Reset the `show_extracted` toggle on article focus change. Done at
+    // the top so we hold no immutable borrow on `app` (the `current_item`
+    // call below would conflict). Logic lives on `App` so it's
+    // unit-testable without spinning up a TestBackend.
+    app.sync_detail_focus_anchor();
     if let Some(item) = app.current_item() {
         // Split the area into header and content with better proportions
         let chunks = Layout::default()
@@ -117,13 +135,70 @@ pub(super) fn render_item_detail<B: Backend>(
 
         f.render_widget(header, chunks[0]);
 
-        // Process content with enhanced formatting
-        let description = if let Some(desc) = &item.description {
-            // Convert HTML to plain text with better width for readability
-            let raw_text = from_read(desc.as_bytes(), 100);
-            format_content_for_reading(&raw_text)
+        // Decide which body to render: the original summary, the extracted
+        // full-text, or a placeholder for in-flight / failed extractions.
+        // Uses `current_article_indices()` (rather than the raw selection
+        // fields) so the lookup matches the resolution logic that
+        // `toggle_or_request_fulltext` already uses — keeps the two sides
+        // in lockstep if detail rendering ever leaks out of FeedItemDetail.
+        let body_source: BodySource = if app.show_extracted {
+            match app
+                .current_article_indices()
+                .and_then(|(fi, ii)| app.extraction_state_for(fi, ii))
+            {
+                Some(ExtractionState::Ready(article)) => {
+                    BodySource::Extracted(article.plain_text.clone())
+                }
+                Some(ExtractionState::Pending { .. }) => BodySource::Extracting,
+                Some(ExtractionState::Failed(reason)) => BodySource::Failed(reason.clone()),
+                None => BodySource::Summary,
+            }
         } else {
-            "No description available".to_string()
+            BodySource::Summary
+        };
+
+        // Computed once and shared by the Summary / Failed branches below.
+        // Lifted out of the match so the description-formatting logic isn't
+        // duplicated when extraction fails and we fall back to the summary.
+        let summary_text = || -> String {
+            if let Some(desc) = &item.description {
+                let raw_text = from_read(desc.as_bytes(), 100);
+                format_content_for_reading(&raw_text)
+            } else {
+                "No description available".to_string()
+            }
+        };
+
+        // The retry / toggle hints embed the *current* binding for
+        // FetchFullText so they stay correct if the user remaps it.
+        let fulltext_key = key_display(&KeyAction::FetchFullText, &app.keybindings);
+
+        let description = match &body_source {
+            BodySource::Summary => summary_text(),
+            BodySource::Failed(reason) => {
+                // Surface the failure reason at the top, then fall back to
+                // the original summary so the user still has something to
+                // read. Press the FetchFullText key again to retry.
+                format!(
+                    "[Full-text extraction failed: {}]\n[Press {} to retry — showing summary]\n\n{}",
+                    reason,
+                    fulltext_key,
+                    summary_text()
+                )
+            }
+            BodySource::Extracted(text) => format_content_for_reading(text),
+            BodySource::Extracting => {
+                // Keep the summary visible while the worker is in flight —
+                // a slow site can take several seconds, and replacing the
+                // body with "Fetching…" leaves the user with nothing to
+                // read AND no way to revert (the FetchFullText key is a
+                // no-op on Pending). The scroll-indicator title (see
+                // body_label below) carries the "Extracting…" status.
+                format!(
+                    "[Fetching full text… — showing summary]\n\n{}",
+                    summary_text()
+                )
+            }
         };
 
         // Calculate the viewport height (accounting for borders and padding)
@@ -153,21 +228,28 @@ pub(super) fn render_item_detail<B: Backend>(
             ("↓", "↑") // Light: simple arrows
         };
 
+        let body_label = match &body_source {
+            BodySource::Summary => "Summary",
+            BodySource::Extracted(_) => "Full-text",
+            BodySource::Extracting => "Extracting…",
+            BodySource::Failed(_) => "Full-text failed",
+        };
+
         let scroll_indicator = if app.detail_max_scroll > 0 {
             let scroll_pct =
                 (app.detail_vertical_scroll as f32 / app.detail_max_scroll as f32 * 100.0) as u16;
             if app.detail_vertical_scroll == 0 {
                 format!(
-                    " {} Article Content · Scroll {} for more ",
-                    article_icon, scroll_arrows.0
+                    " {} {} · Scroll {} for more ",
+                    article_icon, body_label, scroll_arrows.0
                 )
             } else if app.detail_vertical_scroll >= app.detail_max_scroll {
-                format!(" {} Article Content · End of article ", article_icon)
+                format!(" {} {} · End of article ", article_icon, body_label)
             } else {
-                format!(" {} Article Content · {}% ", article_icon, scroll_pct)
+                format!(" {} {} · {}% ", article_icon, body_label, scroll_pct)
             }
         } else {
-            format!(" {} Article Content ", article_icon)
+            format!(" {} {} ", article_icon, body_label)
         };
 
         // Create content paragraph with theme-specific styling

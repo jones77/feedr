@@ -99,6 +99,7 @@ pub enum KeyAction {
     AssignCategory,
     // Detail
     ExtractLinks,
+    FetchFullText,
     ScrollPreviewUp,
     ScrollPreviewDown,
     // Tree
@@ -140,6 +141,7 @@ impl KeyAction {
             Self::OpenCategoryManagement => "open-category-management",
             Self::AssignCategory => "assign-category",
             Self::ExtractLinks => "extract-links",
+            Self::FetchFullText => "fetch-full-text",
             Self::ScrollPreviewUp => "scroll-preview-up",
             Self::ScrollPreviewDown => "scroll-preview-down",
             Self::ToggleExpand => "toggle-expand",
@@ -181,6 +183,7 @@ impl FromStr for KeyAction {
             "open_category_management" => Ok(Self::OpenCategoryManagement),
             "assign_category" => Ok(Self::AssignCategory),
             "extract_links" => Ok(Self::ExtractLinks),
+            "fetch_full_text" => Ok(Self::FetchFullText),
             "scroll_preview_up" => Ok(Self::ScrollPreviewUp),
             "scroll_preview_down" => Ok(Self::ScrollPreviewDown),
             "toggle_expand" => Ok(Self::ToggleExpand),
@@ -352,6 +355,13 @@ pub fn default_keybindings() -> KeyBindingMap {
     map.insert(
         KeyAction::ExtractLinks,
         vec![KeyBinding::new(KeyCode::Char('l'))],
+    );
+    // Capital F (Shift+F). Matches both crossterm's `Char('F')` events and
+    // `Char('F')+SHIFT` thanks to `KeyBinding::matches` using a subset check
+    // on modifiers — same pattern as `JumpBottom` (G).
+    map.insert(
+        KeyAction::FetchFullText,
+        vec![KeyBinding::new(KeyCode::Char('F'))],
     );
     map.insert(
         KeyAction::ScrollPreviewUp,
@@ -1114,6 +1124,7 @@ mod tests {
             KeyAction::OpenCategoryManagement,
             KeyAction::AssignCategory,
             KeyAction::ExtractLinks,
+            KeyAction::FetchFullText,
             KeyAction::ScrollPreviewUp,
             KeyAction::ScrollPreviewDown,
             KeyAction::ToggleExpand,

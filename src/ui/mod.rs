@@ -563,7 +563,7 @@ fn render_help_bar<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: 
                 }
                 View::FeedItemDetail => {
                     format!(
-                        "{}/{}: Scroll | {}/{}: Fast scroll | {}: Open | {}: Star | {}: Toggle read | {}: Links | {}: Search | {}: Theme | {}: Back | {}: Quit",
+                        "{}/{}: Scroll | {}/{}: Fast scroll | {}: Open | {}: Star | {}: Toggle read | {}: Links | {}: Full-text | {}: Search | {}: Theme | {}: Back | {}: Quit",
                         key_display(&KeyAction::MoveUp, &app.keybindings),
                         key_display(&KeyAction::MoveDown, &app.keybindings),
                         key_display(&KeyAction::PageUp, &app.keybindings),
@@ -572,6 +572,7 @@ fn render_help_bar<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: 
                         key_display(&KeyAction::ToggleStar, &app.keybindings),
                         key_display(&KeyAction::ToggleRead, &app.keybindings),
                         key_display(&KeyAction::ExtractLinks, &app.keybindings),
+                        key_display(&KeyAction::FetchFullText, &app.keybindings),
                         key_display(&KeyAction::OpenSearch, &app.keybindings),
                         key_display(&KeyAction::ToggleTheme, &app.keybindings),
                         key_display(&KeyAction::Back, &app.keybindings),
@@ -713,12 +714,13 @@ fn render_compact_help_bar<B: Backend>(
             kd(&KeyAction::OpenSearch),
         ),
         View::FeedItemDetail => format!(
-            "{}:back {}:scroll {}:open {}:star {}:read",
+            "{}:back {}:scroll {}:open {}:star {}:read {}:fulltext",
             kd(&KeyAction::Quit),
             kd(&KeyAction::MoveDown),
             kd(&KeyAction::OpenInBrowser),
             kd(&KeyAction::ToggleStar),
             kd(&KeyAction::ToggleRead),
+            kd(&KeyAction::FetchFullText),
         ),
         View::CategoryManagement => format!("{}:back n:new e:edit d:del", kd(&KeyAction::Quit),),
         View::Starred => format!(
