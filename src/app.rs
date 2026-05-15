@@ -1553,20 +1553,28 @@ impl App {
         }
     }
 
-    /// Exit the detail view and reset scroll position
+    /// Exit the detail view and reset scroll position. Also resets
+    /// `input_mode` so an in-progress `ArticleSearch` session can't strand
+    /// the user in an input mode that no other view renders a cue for.
     pub fn exit_detail_view(&mut self, new_view: View) {
         self.detail_vertical_scroll = 0;
         self.clear_article_search();
+        self.input_mode = InputMode::Normal;
         self.view = new_view;
     }
 
     /// Drop any in-article search state. Called when the focused article
     /// changes, when the user presses `Esc` while typing a query, or when
-    /// the detail view is exited.
+    /// the detail view is exited. Also drops the cached body snapshot so a
+    /// stale buffer can't feed a stray `n`/`N` press across an article
+    /// change — the renderer re-populates on the next frame if a query is
+    /// entered. `String::clear` keeps the allocation for reuse.
     pub fn clear_article_search(&mut self) {
         self.article_search_query.clear();
         self.article_search_current = None;
         self.article_search_matches.clear();
+        self.article_body_cache.clear();
+        self.article_body_width_cache = 0;
     }
 
     /// Advance the in-article match cursor by one and scroll the detail
@@ -2218,15 +2226,25 @@ impl App {
 /// (Unicode-aware), case-insensitive (ASCII fold) otherwise. Returns an
 /// empty `Vec` for an empty query. Lines are indexed by `body.split('\n')`
 /// so the result aligns with what the detail renderer draws.
+///
+/// INVARIANT: the case fold used here MUST be byte-length-preserving so
+/// that byte offsets within the folded haystack remain valid byte offsets
+/// (and valid UTF-8 boundaries) within the original line — the detail
+/// renderer slices the *original* line at `[start..end]` to build the
+/// highlight span. `str::to_ascii_lowercase` satisfies this (it only
+/// flips bit 5 of bytes in `0x41..=0x5A`, never altering byte length or
+/// touching multi-byte UTF-8 sequences). Full Unicode case folding via
+/// `str::to_lowercase` does NOT — e.g. `"İ".to_lowercase() == "i\u{307}"`
+/// changes the byte length. Do not swap the fold without redesigning the
+/// offset model (e.g. by maintaining a parallel folded→original byte map).
+/// The side effect is that non-ASCII characters do not fold in
+/// case-insensitive mode (e.g. `"café"` will not match `"Café"`); that's
+/// the price of the invariant.
 pub fn find_article_matches(body: &str, query: &str) -> Vec<ArticleMatch> {
     if query.is_empty() {
         return Vec::new();
     }
     let case_sensitive = query.chars().any(|c| c.is_uppercase());
-    // `to_ascii_lowercase` is length-preserving (only ASCII A-Z change),
-    // so byte offsets into the folded haystack remain valid against the
-    // original line. Non-ASCII characters in case-insensitive mode are
-    // matched literally — a known v1 limitation.
     let needle = if case_sensitive {
         query.to_string()
     } else {
@@ -4018,10 +4036,20 @@ mod tests {
             start: 0,
             end: 3,
         }];
+        app.article_body_cache = "stale body content".to_string();
+        app.article_body_width_cache = 80;
         app.clear_article_search();
         assert!(app.article_search_query.is_empty());
         assert_eq!(app.article_search_current, None);
         assert!(app.article_search_matches.is_empty());
+        // Body cache must be dropped too — otherwise a stray n/N after the
+        // user clears (then re-typed something on a different article) could
+        // scroll-target against the previous article's text.
+        assert!(
+            app.article_body_cache.is_empty(),
+            "clear_article_search must drop the body cache"
+        );
+        assert_eq!(app.article_body_width_cache, 0);
     }
 
     #[test]
@@ -4033,5 +4061,97 @@ mod tests {
         assert!(app.article_search_query.is_empty());
         assert_eq!(app.detail_vertical_scroll, 0);
         assert_eq!(app.view, View::FeedItems);
+    }
+
+    #[test]
+    fn test_exit_detail_view_resets_input_mode() {
+        // A user typing in the search footer when something else triggers
+        // exit_detail_view (e.g. a macro/remote, or any future code path)
+        // must not be stranded in `ArticleSearch` mode in a different view
+        // that has no footer to surface their input.
+        let mut app = App::new();
+        app.input_mode = InputMode::ArticleSearch;
+        app.article_search_query = "foo".to_string();
+        app.exit_detail_view(View::FeedItems);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn test_find_article_matches_non_ascii_case_insensitive_does_not_fold() {
+        // INVARIANT: the ASCII fold leaves non-ASCII bytes untouched, so
+        // an uppercase non-ASCII letter in the body cannot be matched by
+        // the equivalent lowercase non-ASCII letter in the query. Here
+        // body is "É" (U+00C9, bytes 0xC3 0x89) and query is "é" (U+00E9,
+        // bytes 0xC3 0xA9): different bytes, no match. (Sanity-check the
+        // ASCII path still folds in the same scenario — `C` vs `c` *does*
+        // match because both bytes are in the A-Z fold table.)
+        //
+        // This test pins the v1 behavior so a future change to
+        // Unicode-aware folding is intentional — `str::to_lowercase` is
+        // NOT byte-length-preserving and would silently invalidate the
+        // byte-offset-into-original-line model the highlight render relies
+        // on. See the doc comment on `find_article_matches`.
+        let matches = find_article_matches("É", "é");
+        assert!(
+            matches.is_empty(),
+            "ASCII-fold smart-case must not match non-ASCII case pairs — \
+             changing this requires redesigning the byte-offset model"
+        );
+
+        // ASCII counterpart — same shape (uppercase in body, lowercase in
+        // query, no uppercase in query so case-insensitive mode applies) —
+        // *does* match. Demonstrates the fold is doing its ASCII job; what
+        // doesn't fold above is exclusively the non-ASCII range.
+        let matches = find_article_matches("C", "c");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start, 0);
+        assert_eq!(matches[0].end, 1);
+
+        // And — to lock in the *positive* path for the non-ASCII byte we
+        // care about — a query whose bytes already match the body matches
+        // normally regardless of fold mode.
+        let matches = find_article_matches("Café", "café");
+        assert_eq!(
+            matches.len(),
+            1,
+            "lowercase non-ASCII in both needle and folded haystack must \
+             still match — only the cross-case pair is the gap"
+        );
+        assert_eq!(matches[0].start, 0);
+        assert_eq!(matches[0].end, "Café".len());
+    }
+
+    #[test]
+    fn test_find_article_matches_offsets_valid_with_multibyte_chars() {
+        // Multi-byte char ("é" = 2 bytes in UTF-8) sits in the line before
+        // the ASCII match. The reported byte offsets must land on UTF-8
+        // boundaries in the *original* line, not just the folded one, so
+        // that `&line[start..end]` slicing in `build_styled_body` is safe.
+        let body = "café bar foo baz";
+        // bytes: c(0) a(1) f(2) é(3..5) ' '(5) b(6) a(7) r(8) ' '(9) f(10) o(11) o(12)
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].start, 10);
+        assert_eq!(matches[0].end, 13);
+
+        // Sanity: slicing the original line at the reported offsets must
+        // succeed and yield exactly "foo". If `to_ascii_lowercase` ever
+        // disturbed multi-byte sequences (it doesn't, per docs) this would
+        // panic with a UTF-8 boundary error.
+        assert_eq!(&body[matches[0].start..matches[0].end], "foo");
+    }
+
+    #[test]
+    fn test_find_article_matches_overlapping_needle_advances_past_match() {
+        // Needle "aa" in "aaaa" yields 2 non-overlapping matches at [0..2]
+        // and [2..4] — `scan_line` must step past `end` so we never report
+        // [0..2], [1..3], [2..4] (which would render as nested highlights).
+        let matches = find_article_matches("aaaa", "aa");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].start, 0);
+        assert_eq!(matches[0].end, 2);
+        assert_eq!(matches[1].start, 2);
+        assert_eq!(matches[1].end, 4);
     }
 }
