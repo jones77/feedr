@@ -181,8 +181,7 @@ fn is_global_ip(ip: IpAddr) -> bool {
                 || v4.octets()[0] == 0
                 // CGNAT 100.64.0.0/10
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                // 169.254/16 is link_local; also reject the carrier-grade
-                // /15 and the 192.0.0.0/24 IETF protocol-assignments block.
+                // IETF protocol-assignments 192.0.0.0/24
                 || (v4.octets()[0] == 192
                     && v4.octets()[1] == 0
                     && v4.octets()[2] == 0))
@@ -355,28 +354,47 @@ fn charset_from_content_type(content_type: &str) -> Option<String> {
     None
 }
 
-/// Tiny sniffer for `<meta charset="…">` or `<meta http-equiv="Content-Type"
-/// content="…charset=…">`. Stays byte-level (latin-1 lossy decode is fine
-/// here: ASCII-superset encodings agree on the bytes we care about) so we
-/// don't have to pick an encoding before we know one.
+/// Sniff `<meta charset="…">` or `<meta http-equiv="Content-Type"
+/// content="…charset=…">` from the leading bytes of an HTML document. Only
+/// matches `charset=` that appears INSIDE a `<meta …>` tag — a loose
+/// substring match would be fooled by `data-charset="x"` attributes or
+/// string literals inside `<script>`. Stays byte-level (latin-1 lossy
+/// decode is fine here: ASCII-superset encodings agree on the bytes we
+/// care about) so we don't have to pick an encoding before we know one.
 fn sniff_meta_charset(head: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(head).to_ascii_lowercase();
-    // <meta charset="utf-8">
-    if let Some(idx) = s.find("charset") {
-        let after = &s[idx + "charset".len()..];
-        // Skip optional `=`, whitespace, optional quote
-        let after = after.trim_start();
-        let after = after.strip_prefix('=').unwrap_or(after).trim_start();
-        let after = after
-            .strip_prefix('"')
-            .or_else(|| after.strip_prefix('\''))
-            .unwrap_or(after);
-        let end = after
-            .find(['"', '\'', ' ', '>', ';', '/'])
-            .unwrap_or(after.len());
-        let label = &after[..end];
-        if !label.is_empty() {
-            return Some(label.to_string());
+    let mut cursor = 0;
+    while let Some(rel) = s[cursor..].find("<meta") {
+        let tag_start = cursor + rel;
+        // The character after `<meta` must be whitespace or `/` or `>` so we
+        // don't match e.g. `<metadata>`.
+        let after_name = tag_start + "<meta".len();
+        let next_char = s.as_bytes().get(after_name).copied().unwrap_or(b'>');
+        let is_meta_tag = matches!(next_char, b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>');
+        let tag_end = s[after_name..]
+            .find('>')
+            .map(|e| after_name + e)
+            .unwrap_or(s.len());
+        cursor = tag_end.saturating_add(1);
+        if !is_meta_tag {
+            continue;
+        }
+        let tag = &s[tag_start..tag_end];
+        if let Some(charset_idx) = tag.find("charset") {
+            let after = &tag[charset_idx + "charset".len()..];
+            let after = after.trim_start();
+            let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+            let after = after
+                .strip_prefix('"')
+                .or_else(|| after.strip_prefix('\''))
+                .unwrap_or(after);
+            let end = after
+                .find(['"', '\'', ' ', '>', ';', '/', '\t', '\n', '\r'])
+                .unwrap_or(after.len());
+            let label = &after[..end];
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
         }
     }
     None
@@ -983,6 +1001,55 @@ mod tests {
         let html = "<html><body>Café</body></html>";
         let decoded = decode_html_bytes(html.as_bytes(), "");
         assert!(decoded.contains("Café"));
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_data_charset_attribute() {
+        // A loose substring match would be fooled by `data-charset="bogus"`
+        // and choose `bogus` as the encoding; the tightened sniffer must
+        // only match `charset=` inside an actual <meta> tag.
+        let html = b"<html><head>\
+            <div data-charset=\"bogus-encoding\"></div>\
+            <meta charset=\"windows-1252\">\
+            </head><body>x</body></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(
+            label, "windows-1252",
+            "data-* attribute must be ignored; only <meta charset> wins"
+        );
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_script_content() {
+        // `<script>var x = "charset=evil";</script>` in the head must not
+        // fool the sniffer.
+        let html = b"<html><head>\
+            <script>var s = \"charset=evil-encoding\";</script>\
+            <meta charset=\"utf-8\">\
+            </head><body>x</body></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8", "script literal must be ignored");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_ignores_metadata_tag() {
+        // `<metadata>` must not be matched as `<meta>`.
+        let html = b"<html><head>\
+            <metadata>charset=bogus</metadata>\
+            <meta charset=\"utf-8\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "utf-8");
+    }
+
+    #[test]
+    fn test_sniff_meta_charset_handles_http_equiv_meta() {
+        // The other legal form: <meta http-equiv="Content-Type" content="text/html; charset=…">
+        let html = b"<html><head>\
+            <meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">\
+            </head></html>";
+        let label = sniff_meta_charset(html).expect("should find charset");
+        assert_eq!(label, "iso-8859-1");
     }
 
     #[test]

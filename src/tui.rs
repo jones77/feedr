@@ -268,8 +268,9 @@ fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
         // Auto path → use the safe-redirect client. The URL came from feed
         // XML, so a hostile feed could publish a public-looking link that
         // 302s to RFC1918 / metadata endpoints; revalidating each hop closes
-        // that window.
-        app.request_extraction(id, url.to_string(), true);
+        // that window. Auto requests go to the back of the queue so an
+        // explicit user `Shift+F` is never starved behind a refresh batch.
+        app.request_extraction(id, url.to_string(), true, false);
     }
 }
 
@@ -344,19 +345,19 @@ fn spawn_pending_extractions(
     app: &mut App,
     tx: &mpsc::Sender<(String, Result<ExtractedArticle>)>,
     inflight: &Arc<AtomicUsize>,
+    manual_client: &mut Option<reqwest::blocking::Client>,
+    safe_client: &mut Option<reqwest::blocking::Client>,
 ) {
     if app.pending_extraction_requests.is_empty() {
         return;
     }
     let timeout = app.config.network.http_timeout;
     let user_agent = app.config.network.user_agent.clone();
-    // Two clients: the permissive one for manual `Shift+F` (user-explicit,
-    // same redirect policy as feed fetches) and the safe-redirect one for
-    // the auto path, which revalidates every hop with `is_safe_auto_url`.
-    // Built lazily — if a tick has only manual requests we never construct
-    // the safe client, and vice versa.
-    let mut manual_client: Option<reqwest::blocking::Client> = None;
-    let mut safe_client: Option<reqwest::blocking::Client> = None;
+    // `manual_client` / `safe_client` are owned by `run_app` so the
+    // `reqwest::blocking::Client`s are built at most once per session
+    // instead of once per tick that has work. Lazy build still: if the
+    // session never uses Shift+F we never construct the manual client,
+    // and vice versa.
     let rate_limit = Duration::from_millis(app.config.general.refresh_rate_limit_delay);
     let now = std::time::Instant::now();
 
@@ -399,10 +400,10 @@ fn spawn_pending_extractions(
         // the request and stop.
         let client = if req.safe_redirects {
             match safe_client {
-                Some(ref c) => c.clone(),
+                Some(c) => c.clone(),
                 None => match Feed::build_safe_redirect_client(timeout) {
                     Ok(c) => {
-                        safe_client = Some(c.clone());
+                        *safe_client = Some(c.clone());
                         c
                     }
                     Err(_) => {
@@ -413,10 +414,10 @@ fn spawn_pending_extractions(
             }
         } else {
             match manual_client {
-                Some(ref c) => c.clone(),
+                Some(c) => c.clone(),
                 None => match Feed::build_client(timeout) {
                     Ok(c) => {
-                        manual_client = Some(c.clone());
+                        *manual_client = Some(c.clone());
                         c
                     }
                     Err(_) => {
@@ -426,13 +427,12 @@ fn spawn_pending_extractions(
                 },
             }
         };
-        // Claim the budget slot and stamp the domain BEFORE spawning so a
-        // concurrent caller (or the very next loop iteration) sees the slot
-        // taken / the domain freshly used.
+        // Claim the budget slot before spawning so a concurrent caller (or
+        // the very next loop iteration) sees the slot taken. We defer the
+        // `last_domain_fetch` stamp until AFTER `thread::Builder::spawn`
+        // returns Ok — a rare OS-level spawn failure should re-queue
+        // without burning an extra rate-limit window for the next attempt.
         inflight.fetch_add(1, Ordering::SeqCst);
-        if !domain.is_empty() {
-            app.last_domain_fetch.insert(domain, now);
-        }
         let ua = user_agent.clone();
         let tx = tx.clone();
         let inflight_for_worker = Arc::clone(inflight);
@@ -464,6 +464,12 @@ fn spawn_pending_extractions(
             app.pending_extraction_requests.push_front(req);
             break;
         }
+        // Spawn succeeded — now stamp the domain so the next request for
+        // the same host respects the rate-limit. Done last so a failed
+        // spawn doesn't leave a stale stamp behind.
+        if !domain.is_empty() {
+            app.last_domain_fetch.insert(domain, now);
+        }
     }
     // Re-enqueue throttled requests at the front, preserving their original
     // FIFO order. Without `.rev()` we'd flip them.
@@ -484,6 +490,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
     // on entry and drops it on exit (even on panic), so the pool never
     // deadlocks even if `dom_smoothie` blows up on hostile HTML.
     let extract_inflight = Arc::new(AtomicUsize::new(0));
+    // HTTP clients for extraction workers. Owned at the loop level (not
+    // rebuilt every call to `spawn_pending_extractions`) so a busy refresh
+    // doesn't churn `reqwest::blocking::Client` instances per tick.
+    // Lazy-built on first use of each path: a session that never hits
+    // `Shift+F` never constructs `extract_manual_client`, and vice versa.
+    let mut extract_manual_client: Option<reqwest::blocking::Client> = None;
+    let mut extract_safe_client: Option<reqwest::blocking::Client> = None;
 
     // Initial load of bookmarked feeds
     let (mut pending_count, mut feed_rx) = spawn_feed_refresh(app);
@@ -590,7 +603,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Spawn workers for any extraction requests queued by events or
         // by the feed-refresh path above. Run every iteration so manual
         // `F` requests don't have to wait for a tick boundary.
-        spawn_pending_extractions(app, &extract_tx, &extract_inflight);
+        spawn_pending_extractions(
+            app,
+            &extract_tx,
+            &extract_inflight,
+            &mut extract_manual_client,
+            &mut extract_safe_client,
+        );
 
         // Drain completed extractions back into app state. This is what
         // flips a `Pending` entry to `Ready` / `Failed`, which the detail
@@ -710,7 +729,12 @@ mod tests {
     fn test_record_extraction_result_flips_pending_to_ready() {
         use crate::app::ExtractionState;
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
         // simulate a worker thread completing successfully
         app.record_extraction_result(
             "id1".to_string(),

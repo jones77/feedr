@@ -176,7 +176,18 @@ pub(super) fn render_item_detail<B: Backend>(
                 )
             }
             BodySource::Extracted(text) => format_content_for_reading(text),
-            BodySource::Extracting => "Fetching full text…".to_string(),
+            BodySource::Extracting => {
+                // Keep the summary visible while the worker is in flight —
+                // a slow site can take several seconds, and replacing the
+                // body with "Fetching…" leaves the user with nothing to
+                // read AND no way to revert (Shift+F is a no-op on Pending).
+                // The scroll-indicator title (see body_label below) carries
+                // the "Extracting…" status instead.
+                format!(
+                    "[Fetching full text… — showing summary]\n\n{}",
+                    summary_text()
+                )
+            }
         };
 
         // Calculate the viewport height (accounting for borders and padding)
