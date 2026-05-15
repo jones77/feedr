@@ -188,12 +188,23 @@ fn is_global_ip(ip: IpAddr) -> bool {
                     && v4.octets()[2] == 0))
         }
         IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let seg1 = v6.segments()[1];
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xFE00) == 0xFC00
+                || (seg0 & 0xFE00) == 0xFC00
                 // link-local fe80::/10
-                || (v6.segments()[0] & 0xFFC0) == 0xFE80
+                || (seg0 & 0xFFC0) == 0xFE80
+                // deprecated site-local fec0::/10
+                || (seg0 & 0xFFC0) == 0xFEC0
+                // multicast ff00::/8
+                || (seg0 & 0xFF00) == 0xFF00
+                // 6to4 2002::/16 — routes to embedded IPv4 via 6to4 relays,
+                // so an address like 2002:a9fe:a9fe:: would reach 169.254.169.254
+                || seg0 == 0x2002
+                // NAT64 well-known prefix 64:ff9b::/96
+                || (seg0 == 0x0064 && seg1 == 0xff9b)
                 // IPv4-mapped — defer to v4 check via the embedded address
                 || v6.to_ipv4_mapped().map(|v4| !is_global_ip(IpAddr::V4(v4))).unwrap_or(false))
         }
@@ -519,6 +530,27 @@ impl Feed {
             .timeout(Duration::from_secs(timeout_secs))
             .build()
             .context("Failed to create HTTP client")
+    }
+
+    /// Build an HTTP client whose redirect policy re-validates each hop with
+    /// `is_safe_auto_url`. Used for the auto-fulltext path so a hostile feed
+    /// can't publish a public-looking `<link>` URL that 302s into the user's
+    /// internal network (e.g. RFC1918 / loopback / cloud metadata endpoints).
+    /// The redirect chain is still capped at 10 hops, matching `build_client`.
+    pub fn build_safe_redirect_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.stop();
+                }
+                if !is_safe_auto_url(attempt.url().as_str()) {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            }))
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .context("Failed to create safe-redirect HTTP client")
     }
 
     /// Fetch a URL and return either a parsed feed or discovered feed links.
@@ -985,6 +1017,15 @@ mod tests {
         assert!(!is_safe_auto_url("http://[::1]/x"));
         assert!(!is_safe_auto_url("http://[fc00::1]/x"));
         assert!(!is_safe_auto_url("http://[fe80::1]/x"));
+        // IPv6 deprecated site-local fec0::/10
+        assert!(!is_safe_auto_url("http://[fec0::1]/x"));
+        // IPv6 multicast ff00::/8
+        assert!(!is_safe_auto_url("http://[ff02::1]/x"));
+        // 6to4 wrapping link-local — would route via 6to4 relay to
+        // 169.254.169.254 (cloud metadata).
+        assert!(!is_safe_auto_url("http://[2002:a9fe:a9fe::]/x"));
+        // NAT64 well-known prefix 64:ff9b::/96
+        assert!(!is_safe_auto_url("http://[64:ff9b::a9fe:a9fe]/x"));
     }
 
     #[test]

@@ -265,7 +265,11 @@ fn enqueue_fulltext_for_new(app: &mut App, feed: &Feed, newly_seen: &[usize]) {
             continue;
         }
         let id = crate::app::make_item_id(feed, item);
-        app.request_extraction(id, url.to_string());
+        // Auto path → use the safe-redirect client. The URL came from feed
+        // XML, so a hostile feed could publish a public-looking link that
+        // 302s to RFC1918 / metadata endpoints; revalidating each hop closes
+        // that window.
+        app.request_extraction(id, url.to_string(), true);
     }
 }
 
@@ -346,10 +350,13 @@ fn spawn_pending_extractions(
     }
     let timeout = app.config.network.http_timeout;
     let user_agent = app.config.network.user_agent.clone();
-    let client = match Feed::build_client(timeout) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // Two clients: the permissive one for manual `Shift+F` (user-explicit,
+    // same redirect policy as feed fetches) and the safe-redirect one for
+    // the auto path, which revalidates every hop with `is_safe_auto_url`.
+    // Built lazily — if a tick has only manual requests we never construct
+    // the safe client, and vice versa.
+    let mut manual_client: Option<reqwest::blocking::Client> = None;
+    let mut safe_client: Option<reqwest::blocking::Client> = None;
     let rate_limit = Duration::from_millis(app.config.general.refresh_rate_limit_delay);
     let now = std::time::Instant::now();
 
@@ -365,6 +372,17 @@ fn spawn_pending_extractions(
         let Some(req) = app.pending_extraction_requests.pop_front() else {
             break;
         };
+        // Drop stale requests whose slot was evicted by LRU or removed
+        // because their feed was deleted — running them would burn an HTTP
+        // round-trip only to have `record_extraction_result` discard the
+        // outcome. Cheap monotonic-correctness gate; must come before the
+        // throttle defer so a stale id doesn't bounce back onto the queue.
+        if !matches!(
+            app.extracted.get(&req.id),
+            Some(crate::app::ExtractionState::Pending)
+        ) {
+            continue;
+        }
         let domain = App::extract_domain_from_url(&req.url);
         let too_soon = !rate_limit.is_zero()
             && app
@@ -376,6 +394,38 @@ fn spawn_pending_extractions(
             deferred.push(req);
             continue;
         }
+        // Build (or reuse) the client that matches this request's redirect
+        // policy. A build failure here is permanent for this tick — re-queue
+        // the request and stop.
+        let client = if req.safe_redirects {
+            match safe_client {
+                Some(ref c) => c.clone(),
+                None => match Feed::build_safe_redirect_client(timeout) {
+                    Ok(c) => {
+                        safe_client = Some(c.clone());
+                        c
+                    }
+                    Err(_) => {
+                        app.pending_extraction_requests.push_front(req);
+                        break;
+                    }
+                },
+            }
+        } else {
+            match manual_client {
+                Some(ref c) => c.clone(),
+                None => match Feed::build_client(timeout) {
+                    Ok(c) => {
+                        manual_client = Some(c.clone());
+                        c
+                    }
+                    Err(_) => {
+                        app.pending_extraction_requests.push_front(req);
+                        break;
+                    }
+                },
+            }
+        };
         // Claim the budget slot and stamp the domain BEFORE spawning so a
         // concurrent caller (or the very next loop iteration) sees the slot
         // taken / the domain freshly used.
@@ -383,13 +433,16 @@ fn spawn_pending_extractions(
         if !domain.is_empty() {
             app.last_domain_fetch.insert(domain, now);
         }
-        let client = client.clone();
         let ua = user_agent.clone();
         let tx = tx.clone();
-        let inflight = Arc::clone(inflight);
+        let inflight_for_worker = Arc::clone(inflight);
         let req_id = req.id.clone();
         let req_url = req.url.clone();
-        std::thread::spawn(move || {
+        // `thread::Builder::spawn` returns `io::Result` instead of panicking
+        // on OS-level thread-creation failure (rare, but a panic from the
+        // main TUI loop would crash the app). On failure, release the slot
+        // and re-queue the request so the next tick retries.
+        let spawn_result = std::thread::Builder::new().spawn(move || {
             // `extract_article` and (via dom_smoothie) Readability touch
             // arbitrary HTML; a panic from the worker would otherwise leave
             // the slot stuck on `Pending` for the rest of the session and
@@ -404,8 +457,13 @@ fn spawn_pending_extractions(
                 )),
             };
             let _ = tx.send((req_id, result));
-            inflight.fetch_sub(1, Ordering::SeqCst);
+            inflight_for_worker.fetch_sub(1, Ordering::SeqCst);
         });
+        if spawn_result.is_err() {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            app.pending_extraction_requests.push_front(req);
+            break;
+        }
     }
     // Re-enqueue throttled requests at the front, preserving their original
     // FIFO order. Without `.rev()` we'd flip them.
@@ -652,7 +710,7 @@ mod tests {
     fn test_record_extraction_result_flips_pending_to_ready() {
         use crate::app::ExtractionState;
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         // simulate a worker thread completing successfully
         app.record_extraction_result(
             "id1".to_string(),
@@ -668,6 +726,77 @@ mod tests {
             Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
             other => panic!("expected Ready, got {:?}", other),
         }
+    }
+
+    fn build_feed_with_items(url: &str, items: Vec<(&str, Option<&str>)>) -> Feed {
+        Feed {
+            url: url.to_string(),
+            title: "T".to_string(),
+            title_lower: "t".to_string(),
+            items: items
+                .into_iter()
+                .map(|(title, link)| crate::feed::FeedItem {
+                    title: title.to_string(),
+                    link: link.map(|s| s.to_string()),
+                    description: None,
+                    pub_date: None,
+                    author: None,
+                    formatted_date: None,
+                    parsed_date: None,
+                    plain_text: None,
+                    title_lower: title.to_lowercase(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_skips_when_feed_not_opted_in() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        // Not in fulltext_feeds → must be a no-op even with newly-seen indices.
+        enqueue_fulltext_for_new(&mut app, &feed, &[0]);
+        assert!(app.pending_extraction_requests.is_empty());
+        assert!(app.extracted.is_empty());
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_enqueues_safe_urls_with_safe_flag() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+        enqueue_fulltext_for_new(&mut app, &feed, &[0]);
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+        // Auto path must always tag the request safe_redirects=true so the
+        // worker picks the redirect-revalidating client.
+        assert!(app.pending_extraction_requests[0].safe_redirects);
+    }
+
+    #[test]
+    fn test_enqueue_fulltext_for_new_drops_unsafe_urls() {
+        let mut app = App::new();
+        let feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![
+                ("Internal", Some("http://192.168.1.1/admin")),
+                ("Metadata", Some("http://169.254.169.254/")),
+                ("Bad scheme", Some("javascript:alert(1)")),
+                ("Localhost", Some("http://localhost/x")),
+                ("No link", None),
+                ("Public", Some("https://ex.com/a")),
+            ],
+        );
+        app.fulltext_feeds.insert(feed.url.clone());
+        enqueue_fulltext_for_new(&mut app, &feed, &[0, 1, 2, 3, 4, 5]);
+        // Only the public https URL should make it through.
+        assert_eq!(app.pending_extraction_requests.len(), 1);
+        assert_eq!(app.pending_extraction_requests[0].url, "https://ex.com/a");
     }
 
     #[test]

@@ -151,28 +151,28 @@ pub(super) fn render_item_detail<B: Backend>(
             BodySource::Summary
         };
 
-        let description = match &body_source {
-            BodySource::Summary => {
-                if let Some(desc) = &item.description {
-                    let raw_text = from_read(desc.as_bytes(), 100);
-                    format_content_for_reading(&raw_text)
-                } else {
-                    "No description available".to_string()
-                }
+        // Computed once and shared by the Summary / Failed branches below.
+        // Lifted out of the match so the description-formatting logic isn't
+        // duplicated when extraction fails and we fall back to the summary.
+        let summary_text = || -> String {
+            if let Some(desc) = &item.description {
+                let raw_text = from_read(desc.as_bytes(), 100);
+                format_content_for_reading(&raw_text)
+            } else {
+                "No description available".to_string()
             }
+        };
+
+        let description = match &body_source {
+            BodySource::Summary => summary_text(),
             BodySource::Failed(reason) => {
-                let summary = if let Some(desc) = &item.description {
-                    let raw_text = from_read(desc.as_bytes(), 100);
-                    format_content_for_reading(&raw_text)
-                } else {
-                    "No description available".to_string()
-                };
                 // Surface the failure reason at the top, then fall back to
                 // the original summary so the user still has something to
                 // read. Press F again to retry.
                 format!(
                     "[Full-text extraction failed: {}]\n[Press F to retry — showing summary]\n\n{}",
-                    reason, summary
+                    reason,
+                    summary_text()
                 )
             }
             BodySource::Extracted(text) => format_content_for_reading(text),

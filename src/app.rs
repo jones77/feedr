@@ -228,6 +228,12 @@ pub enum ExtractionState {
 pub struct ExtractionRequest {
     pub id: String,
     pub url: String,
+    /// When true, the worker must use a client whose redirect policy re-runs
+    /// `is_safe_auto_url` on every hop. Set for the auto-fulltext path
+    /// (URLs come from feed XML, untrusted) and cleared for manual `Shift+F`
+    /// (user already chose the article — same trust model as opening it in
+    /// a browser).
+    pub safe_redirects: bool,
 }
 
 /// Cap on the number of cached extracted articles. Auto-fetch over a big
@@ -1799,8 +1805,10 @@ impl App {
 
     /// Mark an item as `Pending` and append the request to the spawn queue.
     /// No-op if the item already has any state (Pending / Ready / Failed) —
-    /// callers should clear or re-request explicitly.
-    pub fn request_extraction(&mut self, id: String, url: String) {
+    /// callers should clear or re-request explicitly. `safe_redirects` selects
+    /// whether the worker uses the safe-redirect client (auto path) or the
+    /// permissive one (manual path); see `ExtractionRequest::safe_redirects`.
+    pub fn request_extraction(&mut self, id: String, url: String, safe_redirects: bool) {
         if id.is_empty() || url.is_empty() {
             return;
         }
@@ -1809,7 +1817,11 @@ impl App {
         }
         self.insert_extraction(id.clone(), ExtractionState::Pending);
         self.pending_extraction_requests
-            .push_back(ExtractionRequest { id, url });
+            .push_back(ExtractionRequest {
+                id,
+                url,
+                safe_redirects,
+            });
     }
 
     /// Forget a single extraction slot (both the state and its LRU
@@ -1889,12 +1901,12 @@ impl App {
             Some(ExtractionState::Failed(_)) => {
                 self.remove_extraction(&id);
                 self.show_extracted = true;
-                self.request_extraction(id, url);
+                self.request_extraction(id, url, false);
                 queued_or_toggled = true;
             }
             None => {
                 self.show_extracted = true;
-                self.request_extraction(id, url);
+                self.request_extraction(id, url, false);
                 queued_or_toggled = true;
             }
         }
@@ -2813,7 +2825,7 @@ mod tests {
     #[test]
     fn test_request_extraction_creates_pending_and_enqueues() {
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         assert!(matches!(
             app.extracted.get("id1"),
             Some(ExtractionState::Pending)
@@ -2822,10 +2834,32 @@ mod tests {
     }
 
     #[test]
+    fn test_request_extraction_stores_safe_redirects_flag() {
+        let mut app = App::new();
+        app.request_extraction("id_auto".to_string(), "https://ex.com/a".to_string(), true);
+        app.request_extraction(
+            "id_manual".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+        );
+        let q: Vec<_> = app.pending_extraction_requests.iter().collect();
+        let auto = q.iter().find(|r| r.id == "id_auto").unwrap();
+        let manual = q.iter().find(|r| r.id == "id_manual").unwrap();
+        assert!(
+            auto.safe_redirects,
+            "auto-path request must carry safe_redirects=true"
+        );
+        assert!(
+            !manual.safe_redirects,
+            "manual-path request must carry safe_redirects=false"
+        );
+    }
+
+    #[test]
     fn test_request_extraction_idempotent_for_already_pending() {
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         // No double-queue: second call must be a no-op because state is Pending.
         assert_eq!(app.pending_extraction_requests.len(), 1);
     }
@@ -2833,7 +2867,7 @@ mod tests {
     #[test]
     fn test_record_extraction_result_transitions_to_ready() {
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("body")));
         match app.extracted.get("id1") {
             Some(ExtractionState::Ready(a)) => assert_eq!(a.plain_text, "body"),
@@ -2844,7 +2878,7 @@ mod tests {
     #[test]
     fn test_record_extraction_result_transitions_to_failed() {
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         app.record_extraction_result("id1".to_string(), Err(anyhow::anyhow!("boom")));
         match app.extracted.get("id1") {
             Some(ExtractionState::Failed(msg)) => assert!(msg.contains("boom")),
@@ -2861,7 +2895,7 @@ mod tests {
         // same here.
         for i in 0..EXTRACTED_CACHE_CAP + 1 {
             let id = format!("id{}", i);
-            app.request_extraction(id.clone(), "https://ex.com/a".to_string());
+            app.request_extraction(id.clone(), "https://ex.com/a".to_string(), false);
             app.record_extraction_result(id, Ok(dummy_extracted("x")));
         }
         assert!(!app.extracted.contains_key("id0"), "oldest must be evicted");
@@ -2875,9 +2909,9 @@ mod tests {
         // request → result transition.
         let id_old = app.get_item_id(0, 0);
         let id_new = app.get_item_id(0, 1);
-        app.request_extraction(id_old.clone(), "https://ex.com/a".to_string());
+        app.request_extraction(id_old.clone(), "https://ex.com/a".to_string(), false);
         app.record_extraction_result(id_old.clone(), Ok(dummy_extracted("a")));
-        app.request_extraction(id_new.clone(), "https://ex.com/b".to_string());
+        app.request_extraction(id_new.clone(), "https://ex.com/b".to_string(), false);
         app.record_extraction_result(id_new.clone(), Ok(dummy_extracted("b")));
         assert_eq!(app.extracted.len(), 2);
 
@@ -2913,7 +2947,7 @@ mod tests {
         // If the slot is already `Ready` (e.g. user manually retried and the
         // retry landed first), a second late worker must not clobber it.
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("first")));
         // Late second worker — slot is Ready, so this must be a no-op.
         app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("late")));
@@ -2933,7 +2967,7 @@ mod tests {
         let mut app = App::new();
         for i in 0..EXTRACTED_CACHE_CAP + 5 {
             let id = format!("id{}", i);
-            app.request_extraction(id, "https://ex.com/a".to_string());
+            app.request_extraction(id, "https://ex.com/a".to_string(), false);
         }
         assert_eq!(
             app.extracted.len(),
@@ -2946,7 +2980,7 @@ mod tests {
     #[test]
     fn test_remove_extraction_helper_prunes_both_map_and_order() {
         let mut app = App::new();
-        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string());
+        app.request_extraction("id1".to_string(), "https://ex.com/a".to_string(), false);
         app.record_extraction_result("id1".to_string(), Ok(dummy_extracted("body")));
         assert_eq!(app.extracted.len(), 1);
         assert_eq!(app.extracted_order.len(), 1);
