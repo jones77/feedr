@@ -432,7 +432,7 @@ impl Config {
              #\n\
              # Supported actions inside macros:\n\
              #   open-in-browser, toggle-star, toggle-read, mark-all-read,\n\
-             #   refresh, toggle-theme, extract-links, help\n\
+             #   refresh, toggle-theme, extract-links, fetch-full-text, help\n\
              # Other keybinding actions are intentionally not callable from macros.\n\
              #\n\
              # Variables expanded per argv token:\n\
