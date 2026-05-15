@@ -1,4 +1,4 @@
-use crate::app::{App, ExtractionState};
+use crate::app::{find_article_matches, App, ArticleMatch, ExtractionState, InputMode};
 use crate::keybindings::{key_display, KeyAction};
 use crate::ui::utils::{count_wrapped_lines, format_content_for_reading, truncate_url};
 use crate::ui::ColorScheme;
@@ -35,15 +35,34 @@ pub(super) fn render_item_detail<B: Backend>(
     // call below would conflict). Logic lives on `App` so it's
     // unit-testable without spinning up a TestBackend.
     app.sync_detail_focus_anchor();
+    // The search footer is visible whenever the user is actively typing a
+    // query OR a committed query has highlights still pinned. Computing
+    // this once up front lets the layout split, footer render, and title
+    // suffix all agree on visibility.
+    let search_footer_visible =
+        matches!(app.input_mode, InputMode::ArticleSearch) || !app.article_search_query.is_empty();
     if let Some(item) = app.current_item() {
-        // Split the area into header and content with better proportions
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(9), // Header - increased for better spacing
-                Constraint::Min(0),    // Content
-            ])
-            .split(area);
+        // Split the area into header, content, and (optionally) a 1-row
+        // search footer. The footer is omitted when in-article search is
+        // inactive so quiet reading is unchanged.
+        let chunks = if search_footer_visible {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(9), // Header
+                    Constraint::Min(0),    // Content
+                    Constraint::Length(1), // Search footer
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(9), // Header
+                    Constraint::Min(0),    // Content
+                ])
+                .split(area)
+        };
 
         // Create header with enhanced typography
         let mut header_lines = vec![
@@ -221,6 +240,52 @@ pub(super) fn render_item_detail<B: Backend>(
         app.update_detail_max_scroll(content_lines, viewport_height);
         app.clamp_detail_scroll();
 
+        // Search work is skipped entirely when the user isn't typing a
+        // query and has no committed query pinned — keeps the steady-state
+        // detail view allocation-free. Without this gate the renderer
+        // would clone the full body string into `article_body_cache` every
+        // frame (default tick rate 100ms ⇒ ~500KB/s churn on a 50KB
+        // full-text article) just to back a feature that wasn't engaged.
+        let search_active = search_footer_visible;
+
+        let (matches, current_idx) = if search_active {
+            // Cache the rendered body and content width so `n` / `N`
+            // (handled in event dispatch) can resolve a match line back to
+            // a wrapped-row scroll target without re-deriving the body
+            // source. Re-derivation here is the source of truth — these
+            // writes happen once per frame the search is live.
+            app.article_body_cache.clear();
+            app.article_body_cache.push_str(&description);
+            app.article_body_width_cache = content_width;
+
+            // Recompute matches against the freshly rendered body. Clamp
+            // the current-match cursor so it stays valid as the query
+            // shrinks or the body changes (e.g. after `Shift+F` toggles
+            // full-text). The clamp lands the cursor on *some* match, not
+            // necessarily the "same" one — the i-th match before a body
+            // change is rarely the i-th match after — but landing on a
+            // valid match beats resetting to 0 every keystroke.
+            let matches = find_article_matches(&description, &app.article_search_query);
+            if matches.is_empty() {
+                app.article_search_current = None;
+            } else {
+                let cur = app
+                    .article_search_current
+                    .unwrap_or(0)
+                    .min(matches.len() - 1);
+                app.article_search_current = Some(cur);
+            }
+            let current_idx = app.article_search_current;
+            app.article_search_matches = matches.clone();
+            (matches, current_idx)
+        } else {
+            // Search inactive: ensure stale state can't satisfy a future
+            // `n`/`N` press, then skip the work.
+            app.article_search_matches.clear();
+            app.article_search_current = None;
+            (Vec::new(), None)
+        };
+
         // Create theme-specific scroll indicator
         let scroll_arrows = if colors.border_normal == BorderType::Double {
             ("▼", "▲") // Dark: solid arrows
@@ -235,25 +300,50 @@ pub(super) fn render_item_detail<B: Backend>(
             BodySource::Failed(_) => "Full-text failed",
         };
 
+        let match_suffix = if app.article_search_query.is_empty() {
+            String::new()
+        } else if matches.is_empty() {
+            " · no matches".to_string()
+        } else {
+            format!(
+                " · {}/{} matches",
+                current_idx.map(|i| i + 1).unwrap_or(0),
+                matches.len()
+            )
+        };
+
         let scroll_indicator = if app.detail_max_scroll > 0 {
             let scroll_pct =
                 (app.detail_vertical_scroll as f32 / app.detail_max_scroll as f32 * 100.0) as u16;
             if app.detail_vertical_scroll == 0 {
                 format!(
-                    " {} {} · Scroll {} for more ",
-                    article_icon, body_label, scroll_arrows.0
+                    " {} {} · Scroll {} for more{} ",
+                    article_icon, body_label, scroll_arrows.0, match_suffix
                 )
             } else if app.detail_vertical_scroll >= app.detail_max_scroll {
-                format!(" {} {} · End of article ", article_icon, body_label)
+                format!(
+                    " {} {} · End of article{} ",
+                    article_icon, body_label, match_suffix
+                )
             } else {
-                format!(" {} {} · {}% ", article_icon, body_label, scroll_pct)
+                format!(
+                    " {} {} · {}%{} ",
+                    article_icon, body_label, scroll_pct, match_suffix
+                )
             }
         } else {
-            format!(" {} {} ", article_icon, body_label)
+            format!(" {} {}{} ", article_icon, body_label, match_suffix)
         };
 
+        // Build the rendered body as styled lines so match ranges can be
+        // highlighted. `Wrap { trim: true }` on the Paragraph preserves
+        // intra-line span styling under soft wrap, so we don't need to
+        // pre-wrap ourselves. Lines without matches collapse to a single
+        // `Span::raw` to avoid unnecessary allocations.
+        let body_lines = build_styled_body(&description, &matches, current_idx, colors);
+
         // Create content paragraph with theme-specific styling
-        let content = Paragraph::new(description)
+        let content = Paragraph::new(body_lines)
             .block(
                 Block::default()
                     .title(scroll_indicator)
@@ -270,5 +360,254 @@ pub(super) fn render_item_detail<B: Backend>(
             .alignment(Alignment::Left);
 
         f.render_widget(content, chunks[1]);
+
+        if search_footer_visible {
+            render_search_footer(f, app, chunks[2], colors);
+        }
+    }
+}
+
+/// Render the 1-row search footer at the bottom of the detail view.
+/// Shows `/<query>` and (when not actively typing) the match indicator.
+/// Sets the terminal cursor on the line when in `ArticleSearch` input
+/// mode so the user sees where input is going.
+fn render_search_footer<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: &ColorScheme) {
+    let typing = matches!(app.input_mode, InputMode::ArticleSearch);
+    let match_count = app.article_search_matches.len();
+    let current = app.article_search_current;
+
+    let mut spans = vec![
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(colors.highlight)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.article_search_query.clone(),
+            Style::default().fg(colors.text),
+        ),
+    ];
+
+    if !typing {
+        let status = if app.article_search_query.is_empty() {
+            String::new()
+        } else if match_count == 0 {
+            "  no matches".to_string()
+        } else {
+            format!(
+                "  {}/{} (n/N to jump · ESC to clear)",
+                current.map(|i| i + 1).unwrap_or(0),
+                match_count
+            )
+        };
+        if !status.is_empty() {
+            spans.push(Span::styled(status, Style::default().fg(colors.muted)));
+        }
+    }
+
+    let footer = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(colors.surface))
+        .alignment(Alignment::Left);
+    f.render_widget(footer, area);
+
+    if typing {
+        // Cursor sits just past the rendered query: 1 column for "/" plus
+        // the display width of the query. Clamp to the visible row width.
+        let q_width =
+            unicode_width::UnicodeWidthStr::width(app.article_search_query.as_str()) as u16;
+        let cursor_x = area.x + 1 + q_width;
+        f.set_cursor(cursor_x.min(area.x + area.width.saturating_sub(1)), area.y);
+    }
+}
+
+/// Build the body as styled `Line`s, applying highlight spans for each
+/// match. The match at `current_idx` (when set) is rendered with a
+/// stronger style so the user can tell which one `n`/`N` will move from.
+///
+/// Lifetimes: the returned `Line`s borrow from `body` directly — unmatched
+/// segments and unmatched whole lines are zero-copy `Span::raw(&str)` /
+/// `Line::raw(&str)`. Only the very thin set of highlight spans need
+/// distinct styling and even those borrow their text from `body`.
+pub(super) fn build_styled_body<'a>(
+    body: &'a str,
+    matches: &[ArticleMatch],
+    current_idx: Option<usize>,
+    colors: &ColorScheme,
+) -> Vec<Line<'a>> {
+    // Non-current matches: foreground tinted only, no background fill, no
+    // bold — present but quiet. The match the `n` cursor sits on gets the
+    // attention: filled `highlight` background, surface-colored text, bold.
+    let highlight_style = Style::default().fg(colors.highlight);
+    let current_style = Style::default()
+        .bg(colors.highlight)
+        .fg(colors.surface)
+        .add_modifier(Modifier::BOLD);
+
+    // `find_article_matches` already emits matches in line-major order
+    // (outer = lines, inner = positions within a line). Walk both lines
+    // and matches with a single cursor instead of bucketing into a
+    // HashMap — saves the allocation and keeps the data flow obvious.
+    let mut match_cursor = 0usize;
+
+    body.split('\n')
+        .enumerate()
+        .map(|(line_idx, line)| {
+            // Skip any matches whose line index is behind us (should not
+            // happen in practice, but defensive against future callers).
+            while match_cursor < matches.len() && matches[match_cursor].line < line_idx {
+                match_cursor += 1;
+            }
+            // Find the contiguous slice of matches that belong to this line.
+            let line_start = match_cursor;
+            while match_cursor < matches.len() && matches[match_cursor].line == line_idx {
+                match_cursor += 1;
+            }
+            let line_matches = &matches[line_start..match_cursor];
+
+            if line_matches.is_empty() {
+                // `Line::from(&'a str)` borrows the slice rather than
+                // copying it (`Line::raw` isn't available in ratatui 0.23).
+                Line::from(line)
+            } else {
+                let mut spans: Vec<Span<'a>> = Vec::with_capacity(line_matches.len() * 2 + 1);
+                let mut col = 0usize;
+                for (offset, m) in line_matches.iter().enumerate() {
+                    if m.start > col {
+                        spans.push(Span::raw(&line[col..m.start]));
+                    }
+                    let style = if Some(line_start + offset) == current_idx {
+                        current_style
+                    } else {
+                        highlight_style
+                    };
+                    spans.push(Span::styled(&line[m.start..m.end], style));
+                    col = m.end;
+                }
+                if col < line.len() {
+                    spans.push(Span::raw(&line[col..]));
+                }
+                Line::from(spans)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::find_article_matches;
+
+    /// Extract the printable text of a `Line` so tests can assert content
+    /// independent of span styling. Joins all span text in order.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn build_styled_body_no_matches_returns_one_raw_line_per_source_line() {
+        let colors = ColorScheme::dark();
+        let body = "alpha\nbeta\ngamma";
+        let lines = build_styled_body(body, &[], None, &colors);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(line_text(&lines[0]), "alpha");
+        assert_eq!(line_text(&lines[1]), "beta");
+        assert_eq!(line_text(&lines[2]), "gamma");
+    }
+
+    #[test]
+    fn build_styled_body_highlights_match_and_preserves_surrounding_text() {
+        let colors = ColorScheme::dark();
+        let body = "before foo after";
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 1);
+
+        let lines = build_styled_body(body, &matches, Some(0), &colors);
+        assert_eq!(lines.len(), 1);
+
+        // Expected span sequence: "before ", "foo" (styled), " after".
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "before ");
+        assert_eq!(spans[1].content.as_ref(), "foo");
+        assert_eq!(spans[2].content.as_ref(), " after");
+
+        // The "current" match must use the filled-background style, not
+        // the foreground-only style — a regression here would mean `n`/`N`
+        // gives no visual signal of which match is focused.
+        let current_style = Style::default()
+            .bg(colors.highlight)
+            .fg(colors.surface)
+            .add_modifier(Modifier::BOLD);
+        assert_eq!(spans[1].style, current_style);
+    }
+
+    #[test]
+    fn build_styled_body_non_current_match_uses_quiet_style() {
+        let colors = ColorScheme::dark();
+        let body = "foo and foo";
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 2);
+
+        // Cursor on match 0; match 1 must render with the quiet style.
+        let lines = build_styled_body(body, &matches, Some(0), &colors);
+        let spans = &lines[0].spans;
+        // Expect: "foo" (current), " and ", "foo" (quiet)
+        assert_eq!(spans.len(), 3);
+        let current_style = Style::default()
+            .bg(colors.highlight)
+            .fg(colors.surface)
+            .add_modifier(Modifier::BOLD);
+        let quiet_style = Style::default().fg(colors.highlight);
+        assert_eq!(spans[0].style, current_style);
+        assert_eq!(spans[2].style, quiet_style);
+    }
+
+    #[test]
+    fn build_styled_body_handles_matches_across_multiple_lines() {
+        let colors = ColorScheme::dark();
+        let body = "first foo line\nsecond foo line";
+        let matches = find_article_matches(body, "foo");
+        assert_eq!(matches.len(), 2);
+
+        let lines = build_styled_body(body, &matches, Some(1), &colors);
+        assert_eq!(lines.len(), 2);
+        // Each line has 3 spans: prefix raw, match, suffix raw.
+        assert_eq!(lines[0].spans.len(), 3);
+        assert_eq!(lines[1].spans.len(), 3);
+        // The "current" highlight must be on line 1 (idx 1), not line 0.
+        let current_style = Style::default()
+            .bg(colors.highlight)
+            .fg(colors.surface)
+            .add_modifier(Modifier::BOLD);
+        assert_eq!(lines[0].spans[1].style.bg, None);
+        assert_eq!(lines[1].spans[1].style, current_style);
+    }
+
+    #[test]
+    fn build_styled_body_match_at_line_start_emits_no_empty_prefix_span() {
+        let colors = ColorScheme::dark();
+        let body = "foo tail";
+        let matches = find_article_matches(body, "foo");
+        let lines = build_styled_body(body, &matches, Some(0), &colors);
+        let spans = &lines[0].spans;
+        // Two spans: styled "foo", raw " tail" — no leading empty Span::raw.
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "foo");
+        assert_eq!(spans[1].content.as_ref(), " tail");
+    }
+
+    #[test]
+    fn build_styled_body_match_at_line_end_emits_no_trailing_empty_span() {
+        let colors = ColorScheme::dark();
+        let body = "head foo";
+        let matches = find_article_matches(body, "foo");
+        let lines = build_styled_body(body, &matches, Some(0), &colors);
+        let spans = &lines[0].spans;
+        // Two spans: raw "head ", styled "foo" — no trailing empty Span::raw.
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "head ");
+        assert_eq!(spans[1].content.as_ref(), "foo");
     }
 }

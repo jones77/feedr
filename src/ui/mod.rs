@@ -563,7 +563,7 @@ fn render_help_bar<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: 
                 }
                 View::FeedItemDetail => {
                     format!(
-                        "{}/{}: Scroll | {}/{}: Fast scroll | {}: Open | {}: Star | {}: Toggle read | {}: Links | {}: Full-text | {}: Search | {}: Theme | {}: Back | {}: Quit",
+                        "{}/{}: Scroll | {}/{}: Fast scroll | {}: Open | {}: Star | {}: Toggle read | {}: Links | {}: Full-text | {}: Find | {}/{}: Next/Prev match | {}: Theme | {}: Back | {}: Quit",
                         key_display(&KeyAction::MoveUp, &app.keybindings),
                         key_display(&KeyAction::MoveDown, &app.keybindings),
                         key_display(&KeyAction::PageUp, &app.keybindings),
@@ -573,7 +573,9 @@ fn render_help_bar<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: 
                         key_display(&KeyAction::ToggleRead, &app.keybindings),
                         key_display(&KeyAction::ExtractLinks, &app.keybindings),
                         key_display(&KeyAction::FetchFullText, &app.keybindings),
-                        key_display(&KeyAction::OpenSearch, &app.keybindings),
+                        key_display(&KeyAction::OpenArticleSearch, &app.keybindings),
+                        key_display(&KeyAction::NextMatch, &app.keybindings),
+                        key_display(&KeyAction::PrevMatch, &app.keybindings),
                         key_display(&KeyAction::ToggleTheme, &app.keybindings),
                         key_display(&KeyAction::Back, &app.keybindings),
                         key_display(&KeyAction::ForceQuit, &app.keybindings),
@@ -616,6 +618,11 @@ fn render_help_bar<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, colors: 
         InputMode::CategoryNameInput => ("".to_string(), Style::default().fg(colors.muted)),
         InputMode::SelectDiscoveredFeed => (
             "j/k: Navigate | Enter: Select feed | Esc: Cancel".to_string(),
+            Style::default().fg(colors.highlight),
+        ),
+        InputMode::ArticleSearch => (
+            "Type to search article (live) | ENTER: keep highlights | n/N: next/prev | ESC: cancel"
+                .to_string(),
             Style::default().fg(colors.highlight),
         ),
     };
@@ -714,13 +721,16 @@ fn render_compact_help_bar<B: Backend>(
             kd(&KeyAction::OpenSearch),
         ),
         View::FeedItemDetail => format!(
-            "{}:back {}:scroll {}:open {}:star {}:read {}:fulltext",
+            "{}:back {}:scroll {}:open {}:star {}:read {}:fulltext {}:find {}/{}:match",
             kd(&KeyAction::Quit),
             kd(&KeyAction::MoveDown),
             kd(&KeyAction::OpenInBrowser),
             kd(&KeyAction::ToggleStar),
             kd(&KeyAction::ToggleRead),
             kd(&KeyAction::FetchFullText),
+            kd(&KeyAction::OpenArticleSearch),
+            kd(&KeyAction::NextMatch),
+            kd(&KeyAction::PrevMatch),
         ),
         View::CategoryManagement => format!("{}:back n:new e:edit d:del", kd(&KeyAction::Quit),),
         View::Starred => format!(

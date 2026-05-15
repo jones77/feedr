@@ -102,6 +102,10 @@ pub enum KeyAction {
     FetchFullText,
     ScrollPreviewUp,
     ScrollPreviewDown,
+    // In-article find (detail view only)
+    OpenArticleSearch,
+    NextMatch,
+    PrevMatch,
     // Tree
     ToggleExpand,
     // Tab
@@ -144,6 +148,9 @@ impl KeyAction {
             Self::FetchFullText => "fetch-full-text",
             Self::ScrollPreviewUp => "scroll-preview-up",
             Self::ScrollPreviewDown => "scroll-preview-down",
+            Self::OpenArticleSearch => "open-article-search",
+            Self::NextMatch => "next-match",
+            Self::PrevMatch => "prev-match",
             Self::ToggleExpand => "toggle-expand",
             Self::NextTab => "next-tab",
             Self::PrevTab => "prev-tab",
@@ -186,6 +193,9 @@ impl FromStr for KeyAction {
             "fetch_full_text" => Ok(Self::FetchFullText),
             "scroll_preview_up" => Ok(Self::ScrollPreviewUp),
             "scroll_preview_down" => Ok(Self::ScrollPreviewDown),
+            "open_article_search" => Ok(Self::OpenArticleSearch),
+            "next_match" => Ok(Self::NextMatch),
+            "prev_match" => Ok(Self::PrevMatch),
             "toggle_expand" => Ok(Self::ToggleExpand),
             "next_tab" => Ok(Self::NextTab),
             "prev_tab" => Ok(Self::PrevTab),
@@ -376,6 +386,21 @@ pub fn default_keybindings() -> KeyBindingMap {
             KeyBinding::with_shift(KeyCode::Char('J')),
             KeyBinding::with_shift(KeyCode::Down),
         ],
+    );
+
+    // In-article find (detail view). `/` is also `OpenSearch` globally,
+    // but the detail-view event arm checks `OpenArticleSearch` first.
+    map.insert(
+        KeyAction::OpenArticleSearch,
+        vec![KeyBinding::new(KeyCode::Char('/'))],
+    );
+    map.insert(
+        KeyAction::NextMatch,
+        vec![KeyBinding::new(KeyCode::Char('n'))],
+    );
+    map.insert(
+        KeyAction::PrevMatch,
+        vec![KeyBinding::new(KeyCode::Char('N'))],
     );
 
     // Tree
@@ -1127,6 +1152,9 @@ mod tests {
             KeyAction::FetchFullText,
             KeyAction::ScrollPreviewUp,
             KeyAction::ScrollPreviewDown,
+            KeyAction::OpenArticleSearch,
+            KeyAction::NextMatch,
+            KeyAction::PrevMatch,
             KeyAction::ToggleExpand,
             KeyAction::NextTab,
             KeyAction::PrevTab,
