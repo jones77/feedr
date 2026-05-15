@@ -298,6 +298,14 @@ category = "Tech"
 [[default_feeds]]
 url = "https://example.com/feed.xml"
 category = "News"
+
+# Optional per-feed refresh threshold (seconds). When this elapses since
+# the last refresh, the next auto-refresh tick is triggered — currently
+# all feeds are refreshed together (no true selective per-feed refresh).
+# Requires `general.refresh_enabled = true`.
+[[default_feeds]]
+url = "https://example.com/fast-feed.xml"
+refresh_interval = 60
 ```
 
 #### Authenticated Feeds
@@ -369,7 +377,7 @@ pipe_default_stdin = "body"   # body | title | url | metadata | none
 ```
 
 **Step kinds:**
-- `<action>` — invoke a built-in action. Supported in macros: `open-in-browser`, `toggle-star`, `toggle-read`, `mark-all-read`, `refresh`, `toggle-theme`, `extract-links`, `help`.
+- `<action>` — invoke a built-in action. Supported in macros: `open-in-browser`, `toggle-star`, `toggle-read`, `mark-all-read`, `refresh`, `toggle-theme`, `extract-links`, `fetch-full-text`, `help`.
 - `pipe-to "cmd %u" [stdin=…]` — suspend the TUI, run the command, and pipe article content to its stdin. `stdin` is one of `body` (default), `title`, `url`, `metadata`, or `none`.
 - `exec "cmd %u"` — spawn the command detached (no stdin, no terminal takeover).
 
@@ -469,6 +477,9 @@ Feedr automatically migrates data from older versions to the new XDG-compliant l
 - **[toml](https://github.com/toml-rs/toml)**: Configuration file parsing
 - **[scraper](https://github.com/causal-agent/scraper)**: HTML parsing for feed auto-discovery
 - **[url](https://github.com/servo/rust-url)**: URL parsing and manipulation
+- **[dom_smoothie](https://github.com/niklak/dom_smoothie)**: Mozilla Readability port for full-text extraction
+- **[encoding_rs](https://github.com/hsivonen/encoding_rs)**: Charset detection for non-UTF-8 article pages
+- **[shlex](https://github.com/comex/rust-shlex)**: Shell-style tokenization for macro/hook command templates
 
 ## License
 
