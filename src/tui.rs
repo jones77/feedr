@@ -484,9 +484,16 @@ fn spawn_pending_extractions(
             app.pending_extraction_requests.push_front(req);
             break;
         }
-        // Spawn succeeded — now stamp the domain so the next request for
-        // the same host respects the rate-limit. Done last so a failed
-        // spawn doesn't leave a stale stamp behind.
+        // Spawn succeeded — flip the slot's `spawned` flag so the watchdog
+        // knows this slot actually holds an inflight permit. Without this,
+        // a queue-stranded request (rate-limited beyond the watchdog
+        // window) would have its inflight slot "released" by the watchdog
+        // even though it never claimed one — silently widening the
+        // effective worker cap by one per spurious release.
+        app.mark_extraction_spawned(&req.id, req.generation);
+        // Stamp the domain so the next request for the same host respects
+        // the rate-limit. Done after spawn so a failed spawn doesn't leave
+        // a stale stamp behind.
         if !domain.is_empty() {
             app.last_domain_fetch.insert(domain, now);
         }
@@ -642,14 +649,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         }
 
         // Watchdog: flip any Pending slot older than `http_timeout * N` to
-        // `Failed("timed out")`. Cheap (cache cap is 500); covers the rare
-        // case where a worker thread is killed externally (OOM, signal,
-        // SIGSEGV in a native dep) and never sends its result. Release one
-        // inflight slot per pruned Pending so a chain of dead workers can't
-        // permanently saturate the pool. The matching saturating sub in the
-        // worker's exit path makes a spurious wake-up (worker actually still
-        // alive, finishes later) safe — at worst we transiently overcommit
-        // by one slot, never underflow.
+        // `Failed("timed out")`. Cost ceiling per tick is bounded by
+        // EXTRACTED_CACHE_CAP (500) map reads — at the configured tick rate
+        // that's ~5k reads/sec worst case, negligible. Covers the rare case
+        // where a worker thread is killed externally (OOM, signal, SIGSEGV
+        // in a native dep) and never sends its result. `prune_*` returns
+        // the count of pruned slots that were actually *spawned* (held an
+        // inflight permit); queue-stranded prunes don't release inflight,
+        // so a long backlog can't shrink the effective pool. The matching
+        // saturating sub in the worker's exit path makes a spurious wake-up
+        // (worker actually still alive, finishes later) safe — at worst we
+        // transiently overcommit by one slot, never underflow.
         let pruned = app
             .prune_stale_pending_extractions(Duration::from_secs(app.config.network.http_timeout));
         for _ in 0..pruned {
@@ -808,7 +818,9 @@ mod tests {
             false,
             false,
         );
-        // Forcibly age both Pending slots past the watchdog window.
+        // Forcibly age both Pending slots past the watchdog window AND
+        // mark them spawned=true so they represent real stuck workers
+        // (the case the watchdog's inflight-release is meant for).
         let aged = std::time::Instant::now()
             .checked_sub(Duration::from_secs(3600))
             .expect("Instant::now() - 1h must be representable");
@@ -820,12 +832,16 @@ mod tests {
                     ExtractionState::Pending {
                         generation: gen,
                         started_at: aged,
+                        spawned: true,
                     },
                 );
             }
         }
         let pruned = app.prune_stale_pending_extractions(Duration::from_secs(30));
-        assert_eq!(pruned, 2, "watchdog must report the slot count");
+        assert_eq!(
+            pruned, 2,
+            "watchdog must report the spawned-pruned count for inflight release"
+        );
     }
 
     #[test]

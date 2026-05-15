@@ -235,9 +235,18 @@ pub enum ExtractionState {
     /// a Pending slot is evicted from the LRU and re-requested for the same
     /// id — without the tag, the old worker's eventual result would land on
     /// the new slot.
+    ///
+    /// `spawned` flips to true only after the spawn loop has both bumped
+    /// the inflight counter AND successfully called `thread::Builder::spawn`.
+    /// A request that ages out while still queued (rate-limited behind a
+    /// backlog longer than the watchdog window) is `spawned == false`, and
+    /// the watchdog MUST NOT release an inflight slot for it — there was no
+    /// permit to release, and a spurious release would shrink the effective
+    /// pool below `EXTRACTION_MAX_INFLIGHT`.
     Pending {
         generation: u64,
         started_at: Instant,
+        spawned: bool,
     },
     Ready(ExtractedArticle),
     Failed(String),
@@ -1843,8 +1852,13 @@ impl App {
             _ => return,
         }
         let state = match result {
+            // `{:#}` flattens the anyhow cause chain into one line
+            // ("outer: caused by: inner"), preserving context that the
+            // default `{}` formatter drops. The user only ever sees the
+            // top message in the detail view, but a chained message helps
+            // when the failure is logged or reported.
             Ok(article) => ExtractionState::Ready(article),
-            Err(e) => ExtractionState::Failed(format!("{}", e)),
+            Err(e) => ExtractionState::Failed(format!("{:#}", e)),
         };
         self.insert_extraction(id, state);
     }
@@ -1876,6 +1890,7 @@ impl App {
             ExtractionState::Pending {
                 generation,
                 started_at: Instant::now(),
+                spawned: false,
             },
         );
         let req = ExtractionRequest {
@@ -1893,8 +1908,9 @@ impl App {
 
     /// Sweep Pending slots that have been in-flight longer than
     /// `http_timeout * PENDING_WATCHDOG_MULTIPLIER`, flip them to
-    /// `Failed("timed out")`, and return the count so the caller can release
-    /// the corresponding inflight budget slots.
+    /// `Failed("timed out")`, and return the count of pruned slots that
+    /// were actually *spawned* — so the caller can release exactly that
+    /// many inflight budget slots.
     ///
     /// A normally-completing worker (success, error, even a Rust panic caught
     /// by `catch_unwind`) always sends a result back through the channel. A
@@ -1903,28 +1919,58 @@ impl App {
     /// blocks `toggle_or_request_fulltext`'s `contains_key` guard. The
     /// returned count is what `run_app` passes to a saturating decrement of
     /// the shared `extract_inflight` counter so the pool doesn't leak budget
-    /// slots across a session. Both the watchdog path and the worker-exit
-    /// path use saturating decrement, so a slow worker that completes AFTER
-    /// the watchdog already released its slot can't underflow the counter.
+    /// slots across a session.
+    ///
+    /// Critically, we only count pruned slots whose `spawned` flag is true:
+    /// a request that aged out while still queued never claimed an inflight
+    /// permit, so releasing one for it would silently widen the effective
+    /// worker cap. Both the watchdog path and the worker-exit path use
+    /// saturating decrement, so a slow worker that completes AFTER the
+    /// watchdog already released its slot can't underflow the counter.
     pub fn prune_stale_pending_extractions(&mut self, http_timeout: std::time::Duration) -> usize {
         let watchdog = http_timeout.saturating_mul(PENDING_WATCHDOG_MULTIPLIER);
         if watchdog.is_zero() {
             return 0;
         }
         let now = Instant::now();
-        let mut to_fail: Vec<String> = Vec::new();
+        let mut to_fail: Vec<(String, bool)> = Vec::new();
         for (id, state) in self.extracted.iter() {
-            if let ExtractionState::Pending { started_at, .. } = state {
+            if let ExtractionState::Pending {
+                started_at,
+                spawned,
+                ..
+            } = state
+            {
                 if now.duration_since(*started_at) > watchdog {
-                    to_fail.push(id.clone());
+                    to_fail.push((id.clone(), *spawned));
                 }
             }
         }
-        let count = to_fail.len();
-        for id in to_fail {
+        let mut spawned_pruned = 0usize;
+        for (id, spawned) in to_fail {
+            if spawned {
+                spawned_pruned += 1;
+            }
             self.insert_extraction(id, ExtractionState::Failed("timed out".to_string()));
         }
-        count
+        spawned_pruned
+    }
+
+    /// Mark a Pending slot as spawned (the spawn loop has bumped the inflight
+    /// counter and successfully called `thread::Builder::spawn`). Idempotent
+    /// — a no-op for any other state, so race conditions where the worker
+    /// already landed a result before this is called are harmless.
+    pub(crate) fn mark_extraction_spawned(&mut self, id: &str, generation: u64) {
+        if let Some(ExtractionState::Pending {
+            generation: g,
+            spawned,
+            ..
+        }) = self.extracted.get_mut(id)
+        {
+            if *g == generation {
+                *spawned = true;
+            }
+        }
     }
 
     /// Forget a single extraction slot (both the state and its LRU
@@ -3215,6 +3261,9 @@ mod tests {
             false,
         );
         // Forcibly age the Pending slot's started_at past the watchdog.
+        // Mark it `spawned=true` so this test exercises the genuine
+        // stuck-worker case (a worker that bumped inflight and never
+        // released it) — that's what the watchdog is meant to recover.
         let id = "id1".to_string();
         let gen = pending_generation(&app, &id);
         let aged = Instant::now()
@@ -3225,6 +3274,7 @@ mod tests {
             ExtractionState::Pending {
                 generation: gen,
                 started_at: aged,
+                spawned: true,
             },
         );
         // 30 s × 3 = 90 s watchdog; aged 3600 s exceeds it.
@@ -3239,6 +3289,145 @@ mod tests {
             }
             other => panic!("expected Failed after watchdog, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_prune_returns_zero_for_aged_but_unspawned_pending() {
+        // Regression test for the inflight-counter drift: a request that
+        // aged out while still queued (rate-limited behind a long backlog)
+        // has `spawned=false`, so the watchdog must NOT count it toward the
+        // inflight-release total. Counting it would silently widen the
+        // effective worker cap because no permit was ever claimed.
+        let mut app = App::new();
+        app.request_extraction(
+            "stranded".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "stranded");
+        // Age the slot but leave `spawned=false` — the request never made
+        // it through the spawn loop.
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        app.extracted.insert(
+            "stranded".to_string(),
+            ExtractionState::Pending {
+                generation: gen,
+                started_at: aged,
+                spawned: false,
+            },
+        );
+        let pruned = app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        assert_eq!(
+            pruned, 0,
+            "watchdog must return zero for queue-stranded prunes — no inflight permit was ever claimed"
+        );
+        // The slot still flips to Failed so the user can retry; only the
+        // inflight-release count is gated on `spawned`.
+        assert!(
+            matches!(
+                app.extracted.get("stranded"),
+                Some(ExtractionState::Failed(_))
+            ),
+            "queue-stranded slot must still be flipped to Failed so a manual retry works"
+        );
+    }
+
+    #[test]
+    fn test_prune_counts_only_spawned_slots_when_mixed() {
+        // Mixed batch: one spawned (real stuck worker) and one queue-stranded.
+        // Only the spawned one should be counted toward inflight release.
+        let mut app = App::new();
+        app.request_extraction(
+            "spawned".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        app.request_extraction(
+            "queued".to_string(),
+            "https://ex.com/b".to_string(),
+            false,
+            false,
+        );
+        let aged = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("Instant::now() - 1h must be representable");
+        let g1 = pending_generation(&app, "spawned");
+        let g2 = pending_generation(&app, "queued");
+        app.extracted.insert(
+            "spawned".to_string(),
+            ExtractionState::Pending {
+                generation: g1,
+                started_at: aged,
+                spawned: true,
+            },
+        );
+        app.extracted.insert(
+            "queued".to_string(),
+            ExtractionState::Pending {
+                generation: g2,
+                started_at: aged,
+                spawned: false,
+            },
+        );
+        let pruned = app.prune_stale_pending_extractions(std::time::Duration::from_secs(30));
+        assert_eq!(pruned, 1, "only the spawned slot must be counted");
+    }
+
+    #[test]
+    fn test_mark_extraction_spawned_flips_flag_on_matching_generation() {
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let gen = pending_generation(&app, "id1");
+        // Before: spawned=false from request_extraction.
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: false, .. })
+        ));
+        app.mark_extraction_spawned("id1", gen);
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: true, .. })
+        ));
+    }
+
+    #[test]
+    fn test_mark_extraction_spawned_is_noop_on_generation_mismatch() {
+        // If the slot was evicted and re-requested between spawn() and
+        // mark_extraction_spawned, the old generation must not flip the
+        // flag on the fresh slot. The stale worker's record_extraction_result
+        // would also be dropped by the generation check, so leaving
+        // spawned=false on the fresh slot is the right semantic.
+        let mut app = App::new();
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let stale_gen = pending_generation(&app, "id1");
+        app.remove_extraction("id1");
+        app.request_extraction(
+            "id1".to_string(),
+            "https://ex.com/a".to_string(),
+            false,
+            false,
+        );
+        let fresh_gen = pending_generation(&app, "id1");
+        assert_ne!(stale_gen, fresh_gen);
+        app.mark_extraction_spawned("id1", stale_gen);
+        assert!(matches!(
+            app.extracted.get("id1"),
+            Some(ExtractionState::Pending { spawned: false, .. })
+        ));
     }
 
     #[test]

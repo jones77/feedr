@@ -299,10 +299,12 @@ pub fn extract_article(
     // Preallocate at the hard cap so `read_to_end`'s doubling growth can
     // never push capacity past it. Without this, starting from a smaller
     // hint (e.g. 64 KiB) grows the backing buffer to ~8 MiB for a 5 MiB
-    // body — invalidating the "peak allocation ~ FULLTEXT_MAX_BYTES" claim.
-    // Modern allocators don't commit physical pages until written, so a
-    // 5 MiB virtual reservation costs essentially zero physical memory
-    // for the common short-page case.
+    // body — making the body-buffer ceiling ambiguous. With the
+    // preallocation, the body-buffer ceiling is exactly FULLTEXT_MAX_BYTES;
+    // the downstream DOM allocation inside dom_smoothie is separate
+    // working-set and not bounded here. Modern allocators don't commit
+    // physical pages until written, so a 5 MiB virtual reservation costs
+    // essentially zero physical memory for the common short-page case.
     let mut bytes = Vec::with_capacity(FULLTEXT_MAX_BYTES + 1);
     let mut reader = response.take((FULLTEXT_MAX_BYTES as u64) + 1);
     reader
@@ -1193,6 +1195,157 @@ mod tests {
             err.to_string().contains("scheme") || err.to_string().contains("not allowed"),
             "expected scheme rejection, got: {}",
             err
+        );
+    }
+
+    // ── extract_article end-to-end tests against a local TcpListener stub ──
+    //
+    // These exercise the wrapping fetch path — Content-Length cap,
+    // Content-Type rejection, and the safe-redirect client's behavior when
+    // a 30x points into a private IP. The pure-Readability parsing path
+    // (extract_from_html) is already covered above; these close the gap on
+    // the network-side security gates.
+    //
+    // No external mock-server dependency: a one-shot TcpListener serves a
+    // single canned HTTP response and exits. Cheap, hermetic, deterministic.
+
+    use std::io::{Read as IoRead, Write as IoWrite};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Spawn a one-shot HTTP stub on 127.0.0.1 that writes `response_bytes`
+    /// verbatim to the first accepted client and closes. Returns the bound
+    /// URL. The stub thread is detached — the OS reclaims it after the test.
+    fn spawn_stub_server(response_bytes: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = listener.local_addr().expect("local_addr").port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read SOME of the request so the client doesn't get a
+                // RST while still writing headers. Single read is enough
+                // for a short GET; we don't actually inspect it.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response_bytes);
+                let _ = stream.flush();
+                // Dropping the stream signals connection close to the client.
+            }
+        });
+        format!("http://127.0.0.1:{}/", port)
+    }
+
+    #[test]
+    fn test_extract_article_rejects_oversized_content_length() {
+        // Server declares 100 MiB body — far past the 5 MiB cap. The
+        // pre-check on the Content-Length header must short-circuit the
+        // read entirely (no body actually streamed in this test).
+        let declared = FULLTEXT_MAX_BYTES * 20;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            declared
+        );
+        let url = spawn_stub_server(resp.into_bytes());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large"),
+            "expected oversized rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_rejects_non_html_content_type() {
+        let body = b"\x89PNG\r\n\x1a\nnotactuallyhtml";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: image/png\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        );
+        let mut bytes = resp.into_bytes();
+        bytes.extend_from_slice(body);
+        let url = spawn_stub_server(bytes);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not return HTML") || msg.contains("content-type"),
+            "expected content-type rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_rejects_redirect_into_private_ip_via_safe_client() {
+        // Stub returns a 302 pointing into RFC1918 space. The
+        // safe-redirect client's policy must refuse to follow — the
+        // resulting response surfaces as a non-2xx status, which
+        // extract_article translates into an "HTTP error" failure.
+        // (Without the safe client, reqwest would happily follow the 302
+        // and probe 192.168.1.1 — the SSRF this exists to prevent.)
+        let resp = b"HTTP/1.1 302 Found\r\n\
+                     Location: http://192.168.1.1/admin\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\
+                     \r\n";
+        let url = spawn_stub_server(resp.to_vec());
+        let client =
+            Feed::build_safe_redirect_client(5).expect("safe-redirect client should build");
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP error") || msg.contains("302"),
+            "expected non-2xx surfacing from refused redirect, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_extract_article_follows_safe_redirect_to_public_target() {
+        // Sanity-check the other side of the redirect policy: a 302 to a
+        // public-looking target is followed. This stub returns 302 →
+        // http://example.invalid/ which the client WILL try to follow.
+        // The follow attempt will fail (example.invalid is unresolvable),
+        // but the failure must be a NETWORK error, NOT the policy-stop
+        // "HTTP error 302" surfacing from the refused-redirect path.
+        // That distinction is what tells us the policy correctly let the
+        // public target through.
+        let resp = b"HTTP/1.1 302 Found\r\n\
+                     Location: http://example.invalid/article\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\
+                     \r\n";
+        let url = spawn_stub_server(resp.to_vec());
+        let client =
+            Feed::build_safe_redirect_client(5).expect("safe-redirect client should build");
+        let err = extract_article(&url, &client, None).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        // Must NOT be "HTTP error 302" — that would mean the policy
+        // refused to follow a public target. Must be a fetch / dns / io
+        // failure from the actual follow attempt.
+        assert!(
+            !msg.contains("http error 302"),
+            "policy must follow public-target redirects, but surfaced 302: {}",
+            msg
+        );
+        assert!(
+            msg.contains("failed to fetch") || msg.contains("dns") || msg.contains("resolve"),
+            "expected a network failure from following the public redirect, got: {}",
+            msg
         );
     }
 }
