@@ -1,7 +1,6 @@
 use crate::app::App;
 use crate::ui::utils::{count_wrapped_lines, format_content_for_reading};
 use crate::ui::ColorScheme;
-use html2text::from_read;
 use ratatui::{
     backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -492,7 +491,7 @@ fn render_preview_pane<B: Backend>(
 
     // Content
     if let Some(desc) = &item.description {
-        let raw_text = from_read(desc.as_bytes(), area.width.saturating_sub(10) as usize);
+        let raw_text = crate::feed::render_clean_html(desc, area.width.saturating_sub(10) as usize);
         let formatted = format_content_for_reading(&raw_text);
         for line in formatted.lines() {
             lines.push(Line::from(vec![Span::styled(

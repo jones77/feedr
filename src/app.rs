@@ -68,7 +68,7 @@ pub enum View {
     Starred,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct App {
     pub config: Config,
     pub feeds: Vec<Feed>,
@@ -195,6 +195,35 @@ pub struct App {
     /// Cached content width (post-border, post-padding) used to compute
     /// wrapped-row positions when jumping to a match.
     pub article_body_width_cache: usize,
+    /// Inline-image cache + Kitty protocol driver. Owned by `App` so the
+    /// detail-view renderer can call `start_fetch` from inside ratatui's
+    /// draw closure (it has `&mut App`). The actual escape emission lives
+    /// in `run_app` after `terminal.draw()` returns — see
+    /// `pending_image_render`.
+    pub image_cache: crate::image::ImageCache,
+    /// Set by the detail-view renderer each frame when an image is loaded
+    /// and ready to draw. Consumed once by `run_app` immediately after
+    /// `terminal.draw()` returns — the run loop emits Kitty placement
+    /// escapes for this rect, then clears the slot. None on every frame
+    /// where no image should be shown (no thumbnail, not on detail view,
+    /// fetch in-flight, fetch failed).
+    pub pending_image_render: Option<PendingImage>,
+    /// True iff the previous frame *was* showing an inline image. Used by
+    /// `run_app` to detect view-change → emit Kitty delete-all so the
+    /// image doesn't bleed onto the next view's cells.
+    pub last_frame_had_image: bool,
+}
+
+/// Detail-view → run_app message: "after the next `terminal.draw()` returns,
+/// place image `url` inside the rect `(col, row, cols, rows)`." Coordinates
+/// are 0-based terminal cells (matching ratatui's `Rect` semantics).
+#[derive(Clone, Debug)]
+pub struct PendingImage {
+    pub url: String,
+    pub col: u16,
+    pub row: u16,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// A single in-article search match, indexed against the rendered body's
@@ -220,6 +249,13 @@ pub struct ArticleContext<'a> {
     pub feed_title: &'a str,
     pub feed_url: &'a str,
     pub plain_text: Option<&'a str>,
+    /// Primary media URL — picked by `FeedItem::primary_media`. None if the
+    /// item has no media attachments. Exposed to macros as `%m`.
+    pub media_url: Option<&'a str>,
+    /// MIME type of the primary media attachment, if known. `%M`.
+    pub media_mime: Option<&'a str>,
+    /// First `<media:thumbnail>` URI on the item, if any. `%i`.
+    pub thumbnail_url: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -433,6 +469,8 @@ impl App {
                 }
             });
 
+        let show_preview = config.ui.show_preview;
+
         let mut app = Self {
             config,
             feeds: Vec::new(),
@@ -468,7 +506,7 @@ impl App {
             color_scheme,
             last_session_time,
             show_summary,
-            preview_pane: false,
+            preview_pane: show_preview,
             preview_scroll: 0,
             preview_max_scroll: 0,
             feed_headers,
@@ -505,6 +543,9 @@ impl App {
             article_search_matches: Vec::new(),
             article_body_cache: String::new(),
             article_body_width_cache: 0,
+            image_cache: crate::image::ImageCache::new(),
+            pending_image_render: None,
+            last_frame_had_image: false,
         };
 
         app.update_dashboard();
@@ -1902,6 +1943,7 @@ impl App {
         let (feed_idx, item_idx) = self.current_article_indices()?;
         let feed = self.feeds.get(feed_idx)?;
         let item = feed.items.get(item_idx)?;
+        let primary = item.primary_media();
         Some(ArticleContext {
             title: &item.title,
             url: item.link.as_deref(),
@@ -1910,6 +1952,9 @@ impl App {
             feed_title: &feed.title,
             feed_url: &feed.url,
             plain_text: item.plain_text.as_deref(),
+            media_url: primary.map(|m| m.url.as_str()),
+            media_mime: primary.and_then(|m| m.mime.as_deref()),
+            thumbnail_url: item.thumbnail.as_deref(),
         })
     }
 
@@ -2323,6 +2368,7 @@ pub fn wrapped_row_of_line(body: &str, target_line_idx: usize, width: usize) -> 
 /// the path used by `exec_on_new`, where the new item may not yet live
 /// inside `App::feeds`.
 pub fn article_context_from<'a>(feed: &'a Feed, item: &'a FeedItem) -> ArticleContext<'a> {
+    let primary = item.primary_media();
     ArticleContext {
         title: &item.title,
         url: item.link.as_deref(),
@@ -2331,6 +2377,9 @@ pub fn article_context_from<'a>(feed: &'a Feed, item: &'a FeedItem) -> ArticleCo
         feed_title: &feed.title,
         feed_url: &feed.url,
         plain_text: item.plain_text.as_deref(),
+        media_url: primary.map(|m| m.url.as_str()),
+        media_mime: primary.and_then(|m| m.mime.as_deref()),
+        thumbnail_url: item.thumbnail.as_deref(),
     }
 }
 
@@ -2374,7 +2423,14 @@ pub fn mark_feed_seen(app: &mut App, feed: &Feed) -> Vec<usize> {
 /// verbatim into individual argv elements.
 ///
 /// Variables: %t title, %u url, %a author, %d formatted-date,
-///            %f feed-title, %F feed-url, %% literal %.
+///            %f feed-title, %F feed-url,
+///            %m primary-media-url, %M primary-media-mime, %i thumbnail-url,
+///            %% literal %.
+///
+/// Placeholders that resolve to no value (e.g. `%m` on a plain text item)
+/// expand to the empty string, matching how `%u` behaves on items missing
+/// `link`. `%m` and `%u` are intentionally orthogonal — no automatic
+/// fallback — so users can compose them explicitly in their macros.
 pub fn expand_argv_template(template: &[String], ctx: &ArticleContext<'_>) -> Vec<String> {
     template
         .iter()
@@ -2398,6 +2454,9 @@ fn expand_one_token(tok: &str, ctx: &ArticleContext<'_>) -> String {
             Some('d') => out.push_str(ctx.formatted_date.unwrap_or("")),
             Some('f') => out.push_str(ctx.feed_title),
             Some('F') => out.push_str(ctx.feed_url),
+            Some('m') => out.push_str(ctx.media_url.unwrap_or("")),
+            Some('M') => out.push_str(ctx.media_mime.unwrap_or("")),
+            Some('i') => out.push_str(ctx.thumbnail_url.unwrap_or("")),
             Some(other) => {
                 out.push('%');
                 out.push(other);
@@ -2494,6 +2553,8 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::days(30)),
                         plain_text: Some("Old content".to_string()),
+                        media: Vec::new(),
+                        thumbnail: None,
                     },
                     FeedItem {
                         title: "New Article".to_string(),
@@ -2505,6 +2566,8 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::hours(1)),
                         plain_text: Some("New content".to_string()),
+                        media: Vec::new(),
+                        thumbnail: None,
                     },
                 ],
             },
@@ -2522,6 +2585,8 @@ mod tests {
                     formatted_date: None,
                     parsed_date: Some(Utc::now() - chrono::Duration::hours(2)),
                     plain_text: Some("Another new content".to_string()),
+                    media: Vec::new(),
+                    thumbnail: None,
                 }],
             },
         ];
@@ -2603,6 +2668,8 @@ mod tests {
                 formatted_date: None,
                 parsed_date: Some(Utc::now() - chrono::Duration::hours(3)),
                 plain_text: Some("Alpha content".to_string()),
+                media: Vec::new(),
+                thumbnail: None,
             }],
         });
         app.last_session_time = Some(Utc::now() - chrono::Duration::days(365));
@@ -2661,7 +2728,9 @@ mod tests {
     #[test]
     fn test_toggle_preview_pane() {
         let mut app = make_test_app();
-        assert!(!app.preview_pane);
+        // Initial state depends on ui.show_preview in the loaded config, so set
+        // it explicitly — this test asserts toggle behavior, not the default.
+        app.preview_pane = false;
         app.preview_scroll = 5;
         app.preview_max_scroll = 10;
 
@@ -2955,6 +3024,24 @@ mod tests {
             feed_title: "Example",
             feed_url: "https://ex.com/feed.xml",
             plain_text: Some("body text"),
+            media_url: Some("https://ex.com/v.mp4"),
+            media_mime: Some("video/mp4"),
+            thumbnail_url: Some("https://ex.com/thumb.jpg"),
+        }
+    }
+
+    fn synthetic_ctx_no_media() -> ArticleContext<'static> {
+        ArticleContext {
+            title: "Plain",
+            url: Some("https://ex.com/p"),
+            author: None,
+            formatted_date: None,
+            feed_title: "Example",
+            feed_url: "https://ex.com/feed.xml",
+            plain_text: None,
+            media_url: None,
+            media_mime: None,
+            thumbnail_url: None,
         }
     }
 
@@ -2981,6 +3068,36 @@ mod tests {
         assert_eq!(argv[0], "a%b");
         // Unknown escapes are passed through verbatim.
         assert_eq!(argv[1], "x%zy");
+    }
+
+    #[test]
+    fn test_expand_media_placeholders() {
+        let tmpl = vec![
+            "%m".to_string(),
+            "--mime=%M".to_string(),
+            "--thumb=%i".to_string(),
+        ];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx());
+        assert_eq!(argv[0], "https://ex.com/v.mp4");
+        assert_eq!(argv[1], "--mime=video/mp4");
+        assert_eq!(argv[2], "--thumb=https://ex.com/thumb.jpg");
+    }
+
+    #[test]
+    fn test_expand_media_placeholders_empty_when_absent() {
+        // `%m` / `%M` / `%i` on an item without media expand to "", not to
+        // the page URL — placeholders are orthogonal to `%u`.
+        let tmpl = vec![
+            "%m".to_string(),
+            "%M".to_string(),
+            "%i".to_string(),
+            "%u".to_string(),
+        ];
+        let argv = expand_argv_template(&tmpl, &synthetic_ctx_no_media());
+        assert_eq!(argv[0], "");
+        assert_eq!(argv[1], "");
+        assert_eq!(argv[2], "");
+        assert_eq!(argv[3], "https://ex.com/p");
     }
 
     #[test]
@@ -3013,6 +3130,8 @@ mod tests {
                 parsed_date: None,
                 plain_text: None,
                 title_lower: t.to_lowercase(),
+                media: Vec::new(),
+                thumbnail: None,
             })
             .collect();
         Feed {
@@ -3154,6 +3273,8 @@ mod tests {
             parsed_date: None,
             plain_text: None,
             title_lower: "t".to_string(),
+            media: Vec::new(),
+            thumbnail: None,
         };
         feed.items.push(item.clone());
         assert_eq!(make_item_id(&feed, &item), "https://ex.com/a");

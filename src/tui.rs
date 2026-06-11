@@ -505,6 +505,29 @@ fn spawn_pending_extractions(
     }
 }
 
+/// Drain `app.pending_image_render` and emit Kitty graphics escapes to
+/// place the image at the reserved rect. On view-change (no pending image
+/// this frame but had one last frame), emit a clear-all so previous-frame
+/// placements don't bleed into the next view. Errors are swallowed — a
+/// failed image emit must never crash the TUI.
+fn emit_inline_image(app: &mut App) -> Result<()> {
+    use std::io::Write;
+    if let Some(pi) = app.pending_image_render.take() {
+        let mut stdout = io::stdout().lock();
+        let _ = app
+            .image_cache
+            .render_at(&mut stdout, &pi.url, pi.col, pi.row, pi.cols, pi.rows);
+        let _ = stdout.flush();
+        app.last_frame_had_image = true;
+    } else if app.last_frame_had_image {
+        let mut stdout = io::stdout().lock();
+        let _ = app.image_cache.clear_terminal(&mut stdout);
+        let _ = stdout.flush();
+        app.last_frame_had_image = false;
+    }
+    Ok(())
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = Duration::from_millis(app.config.ui.tick_rate);
@@ -532,10 +555,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
     let (mut pending_count, mut feed_rx) = spawn_feed_refresh(app);
 
     loop {
+        // Drain any background-fetched inline images so the next render
+        // can use them. Cheap (try_recv loop, no I/O).
+        app.image_cache.poll_completed();
+
         terminal.draw(|f| {
             app.update_compact_mode(f.size().height);
             ui::render(f, app);
         })?;
+
+        // Inline-image post-pass. Runs AFTER `terminal.draw()` so all
+        // ratatui escapes have been flushed; emitting our Kitty escapes
+        // here paints them on top of the (intentionally blank) image
+        // strip the detail view reserved in `app.pending_image_render`.
+        // On view-change we emit `clear_terminal` so a previous frame's
+        // image doesn't bleed into a non-detail view.
+        emit_inline_image(app)?;
 
         // Check if a refresh was requested (by 'r' key or auto-refresh)
         if app.refresh_requested {
@@ -894,9 +929,106 @@ mod tests {
                     parsed_date: None,
                     plain_text: None,
                     title_lower: title.to_lowercase(),
+                    media: Vec::new(),
+                    thumbnail: None,
                 })
                 .collect(),
         }
+    }
+
+    /// Regression lock: the Kitty escapes are emitted after
+    /// `terminal.draw()` returns, so a frame with a visible modal must not
+    /// queue an image placement — it would paint on top of the modal.
+    #[test]
+    fn test_modal_suppresses_pending_image_render() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        let mut feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        feed.items[0].thumbnail = Some("https://ex.com/t.png".to_string());
+        app.feeds.push(feed);
+        app.view = crate::app::View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        // Pretend the thumbnail is already decoded and the terminal speaks
+        // Kitty, so the detail renderer reserves the strip and queues a
+        // placement.
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::Kitty);
+        app.image_cache.insert_image(
+            "https://ex.com/t.png".to_string(),
+            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
+        );
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_some(),
+            "modal-free frame should queue an image placement"
+        );
+
+        app.show_help_overlay = true;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_none(),
+            "frame with a visible modal must not queue an image placement"
+        );
+
+        // Closing the modal restores the placement on the next frame.
+        app.show_help_overlay = false;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(app.pending_image_render.is_some());
+    }
+
+    /// Regression lock: the 10-row image strip must give way to the
+    /// article body — no strip (and no placement) on short terminals or
+    /// in compact mode, where header + strip would squeeze the body to
+    /// near-zero rows.
+    #[test]
+    fn test_image_strip_suppressed_on_short_or_compact_terminals() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        let mut feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        feed.items[0].thumbnail = Some("https://ex.com/t.png".to_string());
+        app.feeds.push(feed);
+        app.view = crate::app::View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::Kitty);
+        app.image_cache.insert_image(
+            "https://ex.com/t.png".to_string(),
+            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
+        );
+
+        // Short terminal: detail area falls below the strip threshold.
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_none(),
+            "short terminal must not reserve the image strip"
+        );
+
+        // Tall terminal but compact mode forced on: also suppressed.
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        app.compact = true;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_none(),
+            "compact mode must not reserve the image strip"
+        );
+
+        // Sanity: same tall terminal, compact off → strip + placement.
+        app.compact = false;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(app.pending_image_render.is_some());
     }
 
     #[test]

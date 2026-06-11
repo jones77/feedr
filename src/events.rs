@@ -1524,6 +1524,8 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::days(30)),
                         plain_text: Some("Old content".to_string()),
+                        media: Vec::new(),
+                        thumbnail: None,
                     },
                     FeedItem {
                         title: "New Article".to_string(),
@@ -1535,6 +1537,8 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::hours(1)),
                         plain_text: Some("New content".to_string()),
+                        media: Vec::new(),
+                        thumbnail: None,
                     },
                 ],
             },
@@ -1552,6 +1556,8 @@ mod tests {
                     formatted_date: None,
                     parsed_date: Some(Utc::now() - chrono::Duration::hours(2)),
                     plain_text: Some("Another new content".to_string()),
+                    media: Vec::new(),
+                    thumbnail: None,
                 }],
             },
         ];

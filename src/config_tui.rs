@@ -146,6 +146,13 @@ pub fn get_fields(section: ConfigSection, config: &Config) -> Vec<FieldInfo> {
                 kind: FieldKind::Enum,
                 description: "auto, always, never".into(),
             },
+            FieldInfo {
+                key: "ui.show_preview".into(),
+                label: "Show Preview Pane".into(),
+                value: config.ui.show_preview.to_string(),
+                kind: FieldKind::Bool,
+                description: "true, false — preview pane open at launch".into(),
+            },
         ],
         ConfigSection::DefaultFeeds => {
             if config.default_feeds.is_empty() {

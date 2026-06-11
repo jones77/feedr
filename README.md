@@ -22,9 +22,10 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Summary View**: "What's New" screen shows articles added since your last session with per-feed stats
 - **Read/Unread Tracking**: Persistent read state tracking across sessions
 - **Mark All Read**: Quickly mark all visible items as read with `m`
-- **Article Preview**: Toggle an inline preview pane in the dashboard view
+- **Article Preview**: Toggle an inline preview pane in the dashboard view, or have it open at launch with `show_preview = true`
 - **Link Extraction**: Extract and browse all links from an article with `l`
 - **Full-Text Extraction**: Strip away summaries and read the actual article content inline via Mozilla Readability — manual on `Shift+F`, or auto-extract on refresh per feed with `fulltext = true`
+- **Inline Images**: When an article has a `<media:thumbnail>` (e.g. YouTube channel feeds, web-comic RSS), Feedr renders it inline in the detail view via the Kitty graphics protocol. Auto-detected on Ghostty, Kitty, and WezTerm; silently no-ops elsewhere. Images are fetched in the background — read or open in browser without waiting.
 - **Help Overlay**: Press `?` for a scrollable keybinding reference overlay
 - **OPML Import**: Bulk import feeds from OPML files via `feedr --import <file.opml>`
 - **Browser Integration**: Open articles in your default browser
@@ -246,6 +247,7 @@ tick_rate = 100                # UI update rate in milliseconds
 error_display_timeout = 3000   # Error message duration in milliseconds
 theme = "dark"                 # Theme: "dark" (cyberpunk) or "light" (zen)
 compact_mode = "auto"          # Compact layout: "auto", "always", or "never"
+show_preview = false           # Start with the dashboard preview pane open
 
 # Optional: Define default feeds to load on first run
 [[default_feeds]]
@@ -276,6 +278,7 @@ Authorization = "Bearer your_token_here"
 - **error_display_timeout**: How long error messages are displayed in milliseconds
 - **theme**: Choose between `"dark"` (cyberpunk aesthetic with neon colors) or `"light"` (zen minimalist with organic colors). Can also be toggled at runtime with `t`.
 - **compact_mode**: Controls the compact layout for small terminals. `"auto"` (default) enables compact mode when terminal height is ≤30 rows, `"always"` forces compact mode, and `"never"` disables it. Compact mode uses single-line items, a minimal title bar, and an abbreviated help bar to maximize screen real estate.
+- **show_preview**: When `true`, the dashboard preview pane is open at launch (default: `false`). The `p` key still toggles it at runtime. Note that the preview pane is always hidden while compact mode is active.
 
 #### Background Refresh Example
 To enable automatic refresh every 5 minutes with rate limiting:
@@ -359,7 +362,12 @@ Expanded in every `argv` token of macro and hook commands:
 | `%d` | Formatted publish date |
 | `%f` | Feed title |
 | `%F` | Feed URL |
+| `%m` | Primary media URL (`<media:content>`, `<enclosure>`, or Atom `<content src>`) |
+| `%M` | MIME type of the primary media |
+| `%i` | First `<media:thumbnail>` URL on the item |
 | `%%` | Literal `%` |
+
+`%m`/`%M`/`%i` expand to the empty string when an item has no media — they're **orthogonal** to `%u` (no fallback). For YouTube channel feeds the watch-page URL is `%u`; the in-feed video URL is `%m`. For RSS podcasts the episode page is `%u`; the audio file is `%m`.
 
 #### Macros
 
@@ -370,6 +378,12 @@ A macro binds a key to an ordered chain of steps. Trigger with `<prefix><key>` (
 y = 'open-in-browser ; pipe-to "yt-dlp %u"'
 w = 'pipe-to "wallabag-cli add %u" -- "Save to Wallabag"'
 n = 'pipe-to "tee /tmp/out.txt" stdin=metadata'
+
+# Media-rich feeds (YouTube channels, web comics, podcasts):
+v = 'exec "mpv %u" -- "Play in mpv"'         # YouTube: mpv resolves the watch URL via yt-dlp
+d = 'exec "yt-dlp -o ~/Videos/%(title)s.%(ext)s %u" -- "Download with yt-dlp"'
+p = 'exec "mpv %m" -- "Play media file"'     # Podcasts: direct .mp3 URL is %m
+i = 'exec "feh %i" -- "View thumbnail"'      # Web comics / YT thumbnails
 
 [macro_options]
 prefix = ","                  # the macro-prefix key

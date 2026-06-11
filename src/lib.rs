@@ -5,6 +5,7 @@ pub mod config_tui;
 pub mod config_ui;
 pub mod events;
 pub mod feed;
+pub mod image;
 pub mod keybindings;
 pub mod tui;
 pub mod ui;
