@@ -433,6 +433,8 @@ impl App {
                 }
             });
 
+        let show_preview = config.ui.show_preview;
+
         let mut app = Self {
             config,
             feeds: Vec::new(),
@@ -468,7 +470,7 @@ impl App {
             color_scheme,
             last_session_time,
             show_summary,
-            preview_pane: false,
+            preview_pane: show_preview,
             preview_scroll: 0,
             preview_max_scroll: 0,
             feed_headers,
@@ -2661,7 +2663,9 @@ mod tests {
     #[test]
     fn test_toggle_preview_pane() {
         let mut app = make_test_app();
-        assert!(!app.preview_pane);
+        // Initial state depends on ui.show_preview in the loaded config, so set
+        // it explicitly — this test asserts toggle behavior, not the default.
+        app.preview_pane = false;
         app.preview_scroll = 5;
         app.preview_max_scroll = 10;
 

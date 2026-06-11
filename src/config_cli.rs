@@ -48,6 +48,10 @@ pub fn list() -> Result<()> {
         ),
         ("ui.theme", "Color theme (light, dark)"),
         ("ui.compact_mode", "Compact mode (auto, always, never)"),
+        (
+            "ui.show_preview",
+            "Show preview pane on launch (true/false)",
+        ),
     ];
 
     for (key, desc) in keys {

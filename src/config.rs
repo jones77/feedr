@@ -100,6 +100,9 @@ pub struct UiConfig {
     /// Compact mode for small terminals (auto, always, never)
     #[serde(default)]
     pub compact_mode: CompactMode,
+    /// Show the dashboard preview pane on launch
+    #[serde(default)]
+    pub show_preview: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +190,7 @@ impl Default for UiConfig {
             error_display_timeout: default_error_timeout(),
             theme: Theme::default(),
             compact_mode: CompactMode::default(),
+            show_preview: false,
         }
     }
 }
@@ -226,6 +230,7 @@ impl Config {
             "ui.error_display_timeout" => Ok(self.ui.error_display_timeout.to_string()),
             "ui.theme" => Ok(self.ui.theme.to_string()),
             "ui.compact_mode" => Ok(self.ui.compact_mode.to_string()),
+            "ui.show_preview" => Ok(self.ui.show_preview.to_string()),
             k if k.starts_with("default_feeds") => {
                 bail!("Feed management is not supported via CLI. Use 'feedr config --tui' instead.")
             }
@@ -302,6 +307,10 @@ impl Config {
                     value
                 ),
             },
+            "ui.show_preview" => {
+                let v: bool = value.parse().context("Expected 'true' or 'false'")?;
+                self.ui.show_preview = v;
+            }
             k if k.starts_with("default_feeds") => {
                 bail!("Feed management is not supported via CLI. Use 'feedr config --tui' instead.")
             }
@@ -384,6 +393,8 @@ impl Config {
              # UI Theme Settings:\n\
              # - theme: Choose between \"light\" or \"dark\" theme (default: dark)\n\
              #   You can also toggle the theme in the app by pressing 't'\n\
+             # - show_preview: Start with the dashboard preview pane open (default: false)\n\
+             #   You can still toggle the preview pane in the app by pressing 'p'\n\
              #\n\
              # Example configuration for auto-refresh every 5 minutes:\n\
              # [general]\n\
@@ -394,6 +405,7 @@ impl Config {
              # [ui]\n\
              # theme = \"light\"\n\
              # compact_mode = \"auto\"  # auto (default), always, or never\n\
+             # show_preview = false  # start with the dashboard preview pane open\n\
              #\n\
              # Example default feeds configuration:\n\
              # [[default_feeds]]\n\
@@ -574,6 +586,33 @@ mod tests {
         assert!(config.macros.is_empty());
         assert_eq!(config.macro_options.prefix, ",");
         assert_eq!(config.macro_options.pipe_default_stdin, "body");
+    }
+
+    #[test]
+    fn test_show_preview_back_compat_and_default() {
+        // An old config with a [ui] table but no show_preview key must
+        // still load, defaulting to false.
+        let toml_str = r#"
+            [ui]
+            theme = "dark"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.ui.show_preview);
+        assert!(!Config::default().ui.show_preview);
+    }
+
+    #[test]
+    fn test_show_preview_get_set() {
+        let mut config = Config::default();
+        assert_eq!(config.get_value("ui.show_preview").unwrap(), "false");
+
+        config.validate_and_set("ui.show_preview", "true").unwrap();
+        assert!(config.ui.show_preview);
+        assert_eq!(config.get_value("ui.show_preview").unwrap(), "true");
+
+        assert!(config.validate_and_set("ui.show_preview", "yes").is_err());
+        // Failed set must not clobber the previous value
+        assert!(config.ui.show_preview);
     }
 
     #[test]

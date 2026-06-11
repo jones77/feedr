@@ -22,7 +22,7 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Summary View**: "What's New" screen shows articles added since your last session with per-feed stats
 - **Read/Unread Tracking**: Persistent read state tracking across sessions
 - **Mark All Read**: Quickly mark all visible items as read with `m`
-- **Article Preview**: Toggle an inline preview pane in the dashboard view
+- **Article Preview**: Toggle an inline preview pane in the dashboard view, or have it open at launch with `show_preview = true`
 - **Link Extraction**: Extract and browse all links from an article with `l`
 - **Full-Text Extraction**: Strip away summaries and read the actual article content inline via Mozilla Readability — manual on `Shift+F`, or auto-extract on refresh per feed with `fulltext = true`
 - **Help Overlay**: Press `?` for a scrollable keybinding reference overlay
@@ -246,6 +246,7 @@ tick_rate = 100                # UI update rate in milliseconds
 error_display_timeout = 3000   # Error message duration in milliseconds
 theme = "dark"                 # Theme: "dark" (cyberpunk) or "light" (zen)
 compact_mode = "auto"          # Compact layout: "auto", "always", or "never"
+show_preview = false           # Start with the dashboard preview pane open
 
 # Optional: Define default feeds to load on first run
 [[default_feeds]]
@@ -276,6 +277,7 @@ Authorization = "Bearer your_token_here"
 - **error_display_timeout**: How long error messages are displayed in milliseconds
 - **theme**: Choose between `"dark"` (cyberpunk aesthetic with neon colors) or `"light"` (zen minimalist with organic colors). Can also be toggled at runtime with `t`.
 - **compact_mode**: Controls the compact layout for small terminals. `"auto"` (default) enables compact mode when terminal height is ≤30 rows, `"always"` forces compact mode, and `"never"` disables it. Compact mode uses single-line items, a minimal title bar, and an abbreviated help bar to maximize screen real estate.
+- **show_preview**: When `true`, the dashboard preview pane is open at launch (default: `false`). The `p` key still toggles it at runtime. Note that the preview pane is always hidden while compact mode is active.
 
 #### Background Refresh Example
 To enable automatic refresh every 5 minutes with rate limiting:
