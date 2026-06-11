@@ -46,15 +46,24 @@ pub(super) fn render_item_detail<B: Backend>(
     // `app.pending_image_render` below. The actual layout decision needs
     // the URL string, which we own here.
     let image_url: Option<String> = app.current_item().and_then(|i| i.thumbnail.clone());
+    // 10 rows is a reasonable thumbnail size on a typical terminal: tall
+    // enough to show the image content, short enough to leave room for the
+    // body below.
+    const IMAGE_STRIP_ROWS: u16 = 10;
+    // Minimum detail-area height to reserve the strip. The header is a
+    // fixed 9 rows and the strip 10, both higher layout priority than the
+    // `Min(0)` body — on anything shorter the body (which loses another 6
+    // rows to borders/padding) collapses to near-zero and the article
+    // becomes unreadable. 30 leaves at least ~5 visible text lines.
+    const MIN_AREA_HEIGHT_FOR_IMAGE: u16 = 30;
     let image_strip_rows: u16 = match &image_url {
         Some(url)
-            if app.image_cache.has_image(url)
+            if !app.compact
+                && area.height >= MIN_AREA_HEIGHT_FOR_IMAGE
+                && app.image_cache.has_image(url)
                 && app.image_cache.protocol() == crate::image::ImageProtocol::Kitty =>
         {
-            // 10 rows is a reasonable thumbnail size on a typical
-            // terminal: tall enough to show the image content, short
-            // enough to leave room for the body below.
-            10
+            IMAGE_STRIP_ROWS
         }
         _ => 0,
     };

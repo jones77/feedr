@@ -984,6 +984,53 @@ mod tests {
         assert!(app.pending_image_render.is_some());
     }
 
+    /// Regression lock: the 10-row image strip must give way to the
+    /// article body — no strip (and no placement) on short terminals or
+    /// in compact mode, where header + strip would squeeze the body to
+    /// near-zero rows.
+    #[test]
+    fn test_image_strip_suppressed_on_short_or_compact_terminals() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        let mut feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        feed.items[0].thumbnail = Some("https://ex.com/t.png".to_string());
+        app.feeds.push(feed);
+        app.view = crate::app::View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::Kitty);
+        app.image_cache.insert_image(
+            "https://ex.com/t.png".to_string(),
+            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
+        );
+
+        // Short terminal: detail area falls below the strip threshold.
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_none(),
+            "short terminal must not reserve the image strip"
+        );
+
+        // Tall terminal but compact mode forced on: also suppressed.
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        app.compact = true;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            app.pending_image_render.is_none(),
+            "compact mode must not reserve the image strip"
+        );
+
+        // Sanity: same tall terminal, compact off → strip + placement.
+        app.compact = false;
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(app.pending_image_render.is_some());
+    }
+
     #[test]
     fn test_enqueue_fulltext_for_new_skips_when_feed_not_opted_in() {
         let mut app = App::new();

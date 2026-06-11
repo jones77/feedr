@@ -118,7 +118,11 @@ struct KittyImage {
 ///   → on first render: transmitted=true (PNG sent to terminal)
 ///
 /// A failed fetch lands as `images: None` (insert-known-failed); subsequent
-/// `start_fetch` calls for that URL no-op.
+/// `start_fetch` calls for that URL no-op. Deliberately permanent (no
+/// retry, no TTL) until the slot ages out of the LRU: a transient network
+/// blip costs that article its thumbnail for the session, in exchange for
+/// never re-hitting a dead URL at render frequency. Revisit if users
+/// report chronically missing thumbnails.
 ///
 /// Debug is implemented manually because the internal `mpsc::Receiver`
 /// has no `Debug` impl — we surface counts instead of contents.
@@ -141,6 +145,17 @@ pub struct ImageCache {
     /// trigger fetches via `&mut App` without the caller threading a client
     /// through every UI layer. Construction is cheap relative to a fetch.
     client: Option<reqwest::blocking::Client>,
+    /// Kitty image id of the placement currently on screen, if any.
+    /// `render_at` deletes the previous placement when the id changes —
+    /// placements are keyed by (image id, placement id), so re-using
+    /// `p=1` across *different* image ids would otherwise stack both
+    /// images in the strip.
+    last_placed_id: Option<u32>,
+    /// Kitty ids whose terminal-side pixel data should be freed (their
+    /// URL was evicted from our cache, so we'd never place them again).
+    /// Deletion needs a writer, which eviction sites don't have — queued
+    /// here and flushed by `render_at` / `clear_terminal`.
+    pending_deletes: Vec<u32>,
 }
 
 impl Default for ImageCache {
@@ -173,6 +188,8 @@ impl ImageCache {
             receiver,
             in_flight: HashSet::new(),
             client: None,
+            last_placed_id: None,
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -197,20 +214,38 @@ impl ImageCache {
     /// oldest entry past `MAX_CACHED_IMAGES`. Eviction also drops the
     /// matching Kitty payload so stale PNG state can't outlive its image;
     /// an evicted-but-displayed URL simply re-fetches on the next render.
+    /// Transmitted ids of dropped payloads are queued so the *terminal's*
+    /// copy of the pixel data is freed too (see `pending_deletes`).
     pub(crate) fn insert_image(&mut self, url: String, img: Option<Arc<DynamicImage>>) {
-        if self.images.insert(url.clone(), img).is_none() {
+        if self.images.insert(url.clone(), img).is_some() {
+            // Overwrite (e.g. a retried known-failure): the old Kitty
+            // payload no longer matches the new image.
+            self.drop_kitty_payload(&url);
+        } else {
             self.images_order.push_back(url);
         }
         while self.images_order.len() > MAX_CACHED_IMAGES {
             if let Some(oldest) = self.images_order.pop_front() {
                 self.images.remove(&oldest);
-                self.kitty_images.remove(&oldest);
+                self.drop_kitty_payload(&oldest);
+            }
+        }
+    }
+
+    /// Remove the Kitty payload for `url`; if its PNG was already
+    /// transmitted, queue a terminal-side data delete for the next flush.
+    fn drop_kitty_payload(&mut self, url: &str) {
+        if let Some(Some(ki)) = self.kitty_images.remove(url) {
+            if ki.transmitted {
+                self.pending_deletes.push(ki.id);
             }
         }
     }
 
     /// Queue a background fetch+decode for `url`. Returns false if the
-    /// concurrency cap is full — caller can re-queue on the next tick.
+    /// fetch could not be started right now (concurrency cap full, or OS
+    /// thread creation failed) — both are transient, and the caller can
+    /// re-queue on the next tick.
     /// Idempotent: re-queueing an in-flight or already-attempted URL is a
     /// no-op (returns true, the "already handled" signal).
     pub fn start_fetch(&mut self, url: &str) -> bool {
@@ -247,16 +282,27 @@ impl ImageCache {
         self.in_flight.insert(url.to_string());
         let sender = self.sender.clone();
         let url_owned = url.to_string();
-        std::thread::spawn(move || {
-            // Panic-safe: a panic in the image decoder must still free the
-            // in-flight slot via `poll_completed`. Without `catch_unwind`,
-            // a single hostile image could permanently strand the slot.
-            let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fetch_and_decode(&url_owned, &client)
-            }))
-            .unwrap_or(None);
-            let _ = sender.send((url_owned, img));
-        });
+        // Builder::spawn (not thread::spawn) so an OS thread-creation
+        // failure is an Err instead of a panic that takes down the TUI —
+        // same hardening as the fulltext extraction workers.
+        let spawned = std::thread::Builder::new()
+            .name("feedr-img-fetch".to_string())
+            .spawn(move || {
+                // Panic-safe: a panic in the image decoder must still free the
+                // in-flight slot via `poll_completed`. Without `catch_unwind`,
+                // a single hostile image could permanently strand the slot.
+                let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_and_decode(&url_owned, &client)
+                }))
+                .unwrap_or(None);
+                let _ = sender.send((url_owned, img));
+            });
+        if spawned.is_err() {
+            // Transient resource exhaustion: release the slot so a later
+            // render can retry rather than caching a permanent failure.
+            self.in_flight.remove(url);
+            return false;
+        }
         true
     }
 
@@ -338,6 +384,9 @@ impl ImageCache {
         if !self.ensure_kitty_ready(url) {
             return Ok(false);
         }
+        // Free terminal-side data for any ids evicted since the last write.
+        self.flush_pending_deletes(stdout)?;
+        let last_placed = self.last_placed_id;
         let ki = match self.kitty_images.get_mut(url).and_then(|o| o.as_mut()) {
             Some(ki) => ki,
             None => return Ok(false),
@@ -361,29 +410,55 @@ impl ImageCache {
             }
             ki.transmitted = true;
         }
-        place_kitty_image(stdout, ki.id, cols, rows)?;
+        let id = ki.id;
+        // Placements are keyed by (image id, placement id). Re-placing the
+        // SAME image id with p=1 replaces the previous placement, but a
+        // DIFFERENT image id would stack on top of the old one — so when
+        // switching images within a frame-pair, delete the old image's
+        // placement first (d=i, lowercase: placement only, its pixel data
+        // stays cached terminal-side for a cheap re-place later).
+        if let Some(old) = last_placed {
+            if old != id {
+                write!(stdout, "\x1b_Ga=d,d=i,i={},q=2\x1b\\", old)?;
+            }
+        }
+        place_kitty_image(stdout, id, cols, rows)?;
+        self.last_placed_id = Some(id);
         // Leave the cursor in a sane spot below the image so the next
         // ratatui frame's diff doesn't get confused.
         write!(stdout, "\x1b[{};1H", rect_row + rows + 1)?;
         Ok(true)
     }
 
-    /// Tell the terminal to drop every Kitty placement. Call when leaving
-    /// any view that was showing an image so it doesn't bleed into the
-    /// next view's cells. Does NOT evict our in-process cache — we keep
-    /// the decoded image and the registered transmit so re-entering the
-    /// view is cheap.
+    /// Tell the terminal to drop every Kitty *placement* (`d=a`, lowercase:
+    /// the transmitted pixel data stays in the terminal's image registry).
+    /// Call when leaving any view that was showing an image so it doesn't
+    /// bleed into the next view's cells. Keeps `kitty_images` intact —
+    /// ids and `transmitted` flags stay valid against the retained
+    /// terminal-side data, so re-entering the view is a single cheap
+    /// placement escape, with no PNG re-encode or re-transmit. Terminal
+    /// data is freed only when a URL ages out of our LRU (`d=I` via
+    /// `pending_deletes`), keeping the terminal's copy bounded by
+    /// `MAX_CACHED_IMAGES`.
     pub fn clear_terminal(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         if self.protocol != ImageProtocol::Kitty {
             return Ok(());
         }
-        // a=d (delete), d=a (all). q=2 suppresses the terminal's response.
+        self.flush_pending_deletes(stdout)?;
+        // a=d (delete), d=a (all visible placements). q=2 suppresses the
+        // terminal's response.
         stdout.write_all(b"\x1b_Ga=d,d=a,q=2\x1b\\")?;
-        // Every image we previously sent is gone from the terminal's
-        // registry, and successful transmits already dropped their PNG
-        // bytes — so drop `kitty_images` entirely and re-encode fresh on
-        // the next render. The decoded `images` cache is preserved.
-        self.kitty_images.clear();
+        self.last_placed_id = None;
+        Ok(())
+    }
+
+    /// Emit `d=I` (uppercase: delete placements AND free pixel data) for
+    /// every id whose URL was evicted from the cache. Queued at eviction
+    /// time because eviction sites have no writer.
+    fn flush_pending_deletes(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        for id in self.pending_deletes.drain(..) {
+            write!(stdout, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id)?;
+        }
         Ok(())
     }
 }
@@ -655,5 +730,136 @@ mod tests {
         place_kitty_image(&mut out, 7, 30, 12).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert_eq!(s, "\x1b_Ga=p,i=7,p=1,q=2,c=30,r=12;\x1b\\");
+    }
+
+    // ── placement / terminal-data lifecycle ─────────────────────────────
+
+    /// Build a Kitty-mode cache with a decoded image already in place.
+    fn cache_with_images(urls: &[&str]) -> ImageCache {
+        let mut cache = ImageCache::new();
+        cache.protocol = ImageProtocol::Kitty;
+        let img = DynamicImage::new_rgb8(8, 8);
+        for url in urls {
+            cache.insert_image(url.to_string(), Some(Arc::new(img.clone())));
+        }
+        cache
+    }
+
+    #[test]
+    fn clear_terminal_deletes_placements_only_and_keeps_transmit_state() {
+        let mut cache = cache_with_images(&["https://x/a.png"]);
+        let mut out: Vec<u8> = Vec::new();
+        assert!(cache
+            .render_at(&mut out, "https://x/a.png", 0, 0, 40, 10)
+            .unwrap());
+        let first = String::from_utf8_lossy(&out).to_string();
+        assert!(first.contains("a=t"), "first render transmits the PNG");
+
+        // View-change clear: placements-only (lowercase d=a), never d=A —
+        // the terminal keeps the pixel data so re-entry is cheap.
+        let mut cleared: Vec<u8> = Vec::new();
+        cache.clear_terminal(&mut cleared).unwrap();
+        let cleared = String::from_utf8_lossy(&cleared).to_string();
+        assert!(
+            cleared.contains("a=d,d=a"),
+            "expected placement-only clear in: {cleared}"
+        );
+        assert!(
+            !cleared.contains("d=A"),
+            "must not free terminal data on view change"
+        );
+        assert!(cache.last_placed_id.is_none());
+
+        // Re-entering the view re-places without re-encoding/re-transmitting.
+        let mut out2: Vec<u8> = Vec::new();
+        assert!(cache
+            .render_at(&mut out2, "https://x/a.png", 0, 0, 40, 10)
+            .unwrap());
+        let second = String::from_utf8_lossy(&out2).to_string();
+        assert!(
+            !second.contains("a=t"),
+            "re-render must not retransmit: {second}"
+        );
+        assert!(
+            second.contains("a=p"),
+            "re-render places the retained image"
+        );
+    }
+
+    #[test]
+    fn switching_images_deletes_previous_placement() {
+        // Regression lock for placement stacking: placements are keyed by
+        // (image id, placement id), so placing image B with p=1 does NOT
+        // replace image A's (id_a, p=1) placement — render_at must delete
+        // it explicitly when the displayed image changes.
+        let mut cache = cache_with_images(&["https://x/a.png", "https://x/b.png"]);
+        let mut out: Vec<u8> = Vec::new();
+        cache
+            .render_at(&mut out, "https://x/a.png", 0, 0, 40, 10)
+            .unwrap();
+        let id_a = cache
+            .kitty_images
+            .get("https://x/a.png")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id;
+
+        let mut out_b: Vec<u8> = Vec::new();
+        cache
+            .render_at(&mut out_b, "https://x/b.png", 0, 0, 40, 10)
+            .unwrap();
+        let s = String::from_utf8_lossy(&out_b).to_string();
+        assert!(
+            s.contains(&format!("a=d,d=i,i={},q=2", id_a)),
+            "expected placement delete for image {id_a} in: {s}"
+        );
+        // Same-image re-render must NOT delete its own placement.
+        let mut out_b2: Vec<u8> = Vec::new();
+        cache
+            .render_at(&mut out_b2, "https://x/b.png", 0, 0, 40, 10)
+            .unwrap();
+        let s2 = String::from_utf8_lossy(&out_b2).to_string();
+        assert!(
+            !s2.contains("a=d,d=i"),
+            "same image re-place needs no delete: {s2}"
+        );
+    }
+
+    #[test]
+    fn lru_eviction_frees_terminal_data_on_next_flush() {
+        let mut cache = cache_with_images(&["https://x/old.png"]);
+        let mut out: Vec<u8> = Vec::new();
+        cache
+            .render_at(&mut out, "https://x/old.png", 0, 0, 40, 10)
+            .unwrap();
+        let old_id = cache
+            .kitty_images
+            .get("https://x/old.png")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id;
+
+        // Push the transmitted image out of the LRU.
+        let img = DynamicImage::new_rgb8(2, 2);
+        for i in 0..MAX_CACHED_IMAGES {
+            cache.insert_image(
+                format!("https://x/fill-{i}.png"),
+                Some(Arc::new(img.clone())),
+            );
+        }
+        assert!(!cache.kitty_images.contains_key("https://x/old.png"));
+        assert_eq!(cache.pending_deletes, vec![old_id]);
+
+        // The next write flushes a d=I (placements + pixel data) for it.
+        let mut cleared: Vec<u8> = Vec::new();
+        cache.clear_terminal(&mut cleared).unwrap();
+        let s = String::from_utf8_lossy(&cleared).to_string();
+        assert!(
+            s.contains(&format!("a=d,d=I,i={},q=2", old_id)),
+            "expected terminal-data delete for {old_id} in: {s}"
+        );
+        assert!(cache.pending_deletes.is_empty());
     }
 }
