@@ -239,7 +239,7 @@ pub(super) fn render_item_detail<B: Backend>(
         // duplicated when extraction fails and we fall back to the summary.
         let summary_text = || -> String {
             if let Some(desc) = &item.description {
-                let raw_text = crate::ui::utils::render_clean_html(desc, 100);
+                let raw_text = crate::feed::render_clean_html(desc, 100);
                 format_content_for_reading(&raw_text)
             } else {
                 "No description available".to_string()

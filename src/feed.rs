@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use dom_smoothie::{Config as ReadabilityConfig, Readability};
 use feed_rs::parser;
+use html2text::render::text_renderer::{TaggedLine, TextDecorator};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -815,13 +816,11 @@ impl FeedItem {
         };
 
         // Cache plain text from description (avoids repeated HTML parsing).
-        // Table structure is flattened first — see `flatten_description_html`
-        // for why (Reddit RSS in particular wraps metadata in a 2-column
-        // table that html2text would otherwise render with `|` separators).
-        let plain_text = description.as_ref().map(|desc| {
-            let prepped = flatten_description_html(desc);
-            html2text::from_read(prepped.as_bytes(), 80)
-        });
+        // Rendered through the same `render_clean_html` path as the
+        // detail/dashboard views so pipe payloads and content filters see
+        // the text the user sees — tables flattened, no `[N]` link markers,
+        // no footnote dump.
+        let plain_text = description.as_ref().map(|desc| render_clean_html(desc, 80));
 
         // Extract the primary link
         let link = entry.links.first().map(|link| link.href.clone());
@@ -1052,6 +1051,105 @@ pub(crate) fn flatten_description_html(html: &str) -> String {
     out
 }
 
+/// html2text decorator tuned for RSS-summary rendering. Differs from the
+/// crate's default `PlainDecorator` in two ways:
+///
+/// * **No link annotations.** `decorate_link_start`/`_end` and `finalise`
+///   return empty strings, so anchors render as just their inner text — no
+///   `[text][N]` markers and no `[N]: url` footnote dump at the bottom.
+///   RSS summaries (Reddit especially) are otherwise drowned in
+///   `submitted by [ /u/... ][2] [[link]][3] [[comments]][4]` boilerplate
+///   plus a multi-line footnote block, none of which the user needs — the
+///   article URL is already shown in the detail-view header.
+/// * **Image alt text falls back to title.** Same as `PlainDecorator`
+///   (`[title]`) so the user still sees *something* for inline images.
+///
+/// Emphasis (`*…*`), strong (`**…**`), code (`` `…` ``), list/header/quote
+/// prefixes are preserved.
+///
+/// Lives here (not in `ui/`) because the cached `FeedItem::plain_text` is
+/// built with it at parse time — pipe payloads, content filters, and the
+/// rendered views must all see the same text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CleanDecorator;
+
+impl CleanDecorator {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl TextDecorator for CleanDecorator {
+    type Annotation = ();
+
+    fn decorate_link_start(&mut self, _url: &str) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_em_start(&mut self) -> (String, Self::Annotation) {
+        ("*".to_string(), ())
+    }
+    fn decorate_em_end(&mut self) -> String {
+        "*".to_string()
+    }
+    fn decorate_strong_start(&mut self) -> (String, Self::Annotation) {
+        ("**".to_string(), ())
+    }
+    fn decorate_strong_end(&mut self) -> String {
+        "**".to_string()
+    }
+    fn decorate_strikeout_start(&mut self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_strikeout_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_code_start(&mut self) -> (String, Self::Annotation) {
+        ("`".to_string(), ())
+    }
+    fn decorate_code_end(&mut self) -> String {
+        "`".to_string()
+    }
+    fn decorate_preformat_first(&mut self) -> Self::Annotation {}
+    fn decorate_preformat_cont(&mut self) -> Self::Annotation {}
+    fn decorate_image(&mut self, _src: &str, title: &str) -> (String, Self::Annotation) {
+        (format!("[{}]", title), ())
+    }
+    fn header_prefix(&mut self, level: usize) -> String {
+        "#".repeat(level) + " "
+    }
+    fn quote_prefix(&mut self) -> String {
+        "> ".to_string()
+    }
+    fn unordered_item_prefix(&mut self) -> String {
+        "* ".to_string()
+    }
+    fn ordered_item_prefix(&mut self, i: i64) -> String {
+        format!("{}. ", i)
+    }
+    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<()>> {
+        // Crucially: no footnote-style `[N]: url` lines. The default
+        // `PlainDecorator` returns one per link here — that's the entire
+        // reason summaries grew a noisy reference-list trailer.
+        Vec::new()
+    }
+    fn make_subblock_decorator(&self) -> Self {
+        Self
+    }
+}
+
+/// Convenience: flatten any `<table>` markup, then render with
+/// [`CleanDecorator`] at the given width. The single HTML→text path for
+/// feed descriptions: `FeedItem::plain_text` (pipe payloads, filters) and
+/// the detail/dashboard views all go through here, so what the user sees,
+/// searches, and pipes is the same text.
+pub(crate) fn render_clean_html(html: &str, width: usize) -> String {
+    let prepped = flatten_description_html(html);
+    html2text::from_read_with_decorator(prepped.as_bytes(), width, CleanDecorator::new())
+}
+
 fn format_date(dt: DateTime<Utc>) -> String {
     // Calculate how long ago the item was published
     let now = Utc::now();
@@ -1139,6 +1237,86 @@ mod tests {
             "expected no column separators in flattened output, got:\n{text}"
         );
         assert!(text.contains("Title here"));
+    }
+
+    #[test]
+    fn render_clean_html_drops_reddit_link_footnotes() {
+        // Reddit summary: title link, body, "submitted by" line with three
+        // anchors. Default html2text would emit `[N]` markers inline plus a
+        // `[N]: url` footnote dump. Our decorator must produce neither.
+        let html = r#"<table><tr><td><a href="https://example.com/post"><img src="https://example.com/x.jpg"/></a></td><td><a href="https://example.com/post"><b>Excuse me?! What??</b></a><br/>This is weird, right? Like what is going on with <em>suggestive</em> content lately?!<br/>submitted by <a href="https://www.reddit.com/user/A">/u/A</a> <a href="https://example.com/post">[link]</a> <a href="https://example.com/post">[comments]</a></td></tr></table>"#;
+        let out = render_clean_html(html, 80);
+        // No reference markers anywhere.
+        assert!(
+            !out.contains("][1]") && !out.contains("][2]") && !out.contains("][3]"),
+            "expected no `][N]` link markers in:\n{out}"
+        );
+        // No footnote dump.
+        assert!(
+            !out.contains("[1]:") && !out.contains("[2]:"),
+            "expected no `[N]: url` footnotes in:\n{out}"
+        );
+        // No `|` column artifacts from the table.
+        assert!(
+            !out.contains('|'),
+            "expected no column separators in:\n{out}"
+        );
+        // Anchor inner text is preserved.
+        assert!(out.contains("Excuse me?! What??"));
+        assert!(out.contains("/u/A"));
+        // Emphasis is preserved (this is what distinguishes us from
+        // html2text's TrivialDecorator, which would strip the `*`s).
+        assert!(
+            out.contains("*suggestive*"),
+            "expected `<em>` to render as `*...*` in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_clean_html_strips_image_with_empty_alt() {
+        // An image with no alt/title should render as `[]` (PlainDecorator
+        // behavior we inherit) rather than disappearing — the user still
+        // gets a visible hint that something was there.
+        let html = r#"<p>Before <img src="https://example.com/x.png"/> after.</p>"#;
+        let out = render_clean_html(html, 80);
+        assert!(out.contains("Before"));
+        assert!(out.contains("after."));
+    }
+
+    #[test]
+    fn plain_text_cache_matches_clean_rendering() {
+        // The cached plain_text (pipe payloads, content filters) must go
+        // through the same clean-render path as the views: no `[N]` link
+        // markers, no footnote dump.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>x</title>
+    <link>https://example.com/</link>
+    <description>x</description>
+    <item>
+      <title>Post</title>
+      <link>https://example.com/p1</link>
+      <guid>https://example.com/p1</guid>
+      <description>&lt;p&gt;Read &lt;a href="https://example.com/more"&gt;the rest&lt;/a&gt; now.&lt;/p&gt;</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        let plain = item.plain_text.expect("plain_text cached");
+        assert!(plain.contains("the rest"));
+        assert!(
+            !plain.contains("[1]") && !plain.contains("[1]:"),
+            "expected no link annotations in cached plain_text:\n{plain}"
+        );
+        assert_eq!(
+            plain,
+            render_clean_html(
+                "<p>Read <a href=\"https://example.com/more\">the rest</a> now.</p>",
+                80
+            )
+        );
     }
 
     #[test]
