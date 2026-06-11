@@ -1,5 +1,99 @@
+use html2text::render::text_renderer::{TaggedLine, TextDecorator};
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// html2text decorator tuned for RSS-summary rendering. Differs from the
+/// crate's default `PlainDecorator` in two ways:
+///
+/// * **No link annotations.** `decorate_link_start`/`_end` and `finalise`
+///   return empty strings, so anchors render as just their inner text — no
+///   `[text][N]` markers and no `[N]: url` footnote dump at the bottom.
+///   RSS summaries (Reddit especially) are otherwise drowned in
+///   `submitted by [ /u/... ][2] [[link]][3] [[comments]][4]` boilerplate
+///   plus a multi-line footnote block, none of which the user needs — the
+///   article URL is already shown in the detail-view header.
+/// * **Image alt text falls back to title.** Same as `PlainDecorator`
+///   (`[title]`) so the user still sees *something* for inline images.
+///
+/// Emphasis (`*…*`), strong (`**…**`), code (`` `…` ``), list/header/quote
+/// prefixes are preserved.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CleanDecorator;
+
+impl CleanDecorator {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl TextDecorator for CleanDecorator {
+    type Annotation = ();
+
+    fn decorate_link_start(&mut self, _url: &str) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_em_start(&mut self) -> (String, Self::Annotation) {
+        ("*".to_string(), ())
+    }
+    fn decorate_em_end(&mut self) -> String {
+        "*".to_string()
+    }
+    fn decorate_strong_start(&mut self) -> (String, Self::Annotation) {
+        ("**".to_string(), ())
+    }
+    fn decorate_strong_end(&mut self) -> String {
+        "**".to_string()
+    }
+    fn decorate_strikeout_start(&mut self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_strikeout_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_code_start(&mut self) -> (String, Self::Annotation) {
+        ("`".to_string(), ())
+    }
+    fn decorate_code_end(&mut self) -> String {
+        "`".to_string()
+    }
+    fn decorate_preformat_first(&mut self) -> Self::Annotation {}
+    fn decorate_preformat_cont(&mut self) -> Self::Annotation {}
+    fn decorate_image(&mut self, _src: &str, title: &str) -> (String, Self::Annotation) {
+        (format!("[{}]", title), ())
+    }
+    fn header_prefix(&mut self, level: usize) -> String {
+        "#".repeat(level) + " "
+    }
+    fn quote_prefix(&mut self) -> String {
+        "> ".to_string()
+    }
+    fn unordered_item_prefix(&mut self) -> String {
+        "* ".to_string()
+    }
+    fn ordered_item_prefix(&mut self, i: i64) -> String {
+        format!("{}. ", i)
+    }
+    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<()>> {
+        // Crucially: no footnote-style `[N]: url` lines. The default
+        // `PlainDecorator` returns one per link here — that's the entire
+        // reason summaries grew a noisy reference-list trailer.
+        Vec::new()
+    }
+    fn make_subblock_decorator(&self) -> Self {
+        Self
+    }
+}
+
+/// Convenience: flatten any `<table>` markup, then render with
+/// [`CleanDecorator`] at the given width. Used by detail/dashboard views
+/// to convert a feed item's HTML description into prose plain text.
+pub(crate) fn render_clean_html(html: &str, width: usize) -> String {
+    let prepped = crate::feed::flatten_description_html(html);
+    html2text::from_read_with_decorator(prepped.as_bytes(), width, CleanDecorator::new())
+}
 
 // Helper function to create a centered rect with minimum dimensions
 pub(crate) fn centered_rect_with_min(
@@ -156,4 +250,53 @@ pub(crate) fn count_wrapped_lines(text: &str, width: usize) -> u16 {
     // If text doesn't end with newline, we still have the lines we counted
     // If text is empty, return at least 1 line
     line_count.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_clean_html_drops_reddit_link_footnotes() {
+        // Reddit summary: title link, body, "submitted by" line with three
+        // anchors. Default html2text would emit `[N]` markers inline plus a
+        // `[N]: url` footnote dump. Our decorator must produce neither.
+        let html = r#"<table><tr><td><a href="https://example.com/post"><img src="https://example.com/x.jpg"/></a></td><td><a href="https://example.com/post"><b>Excuse me?! What??</b></a><br/>This is weird, right? Like what is going on with <em>suggestive</em> content lately?!<br/>submitted by <a href="https://www.reddit.com/user/A">/u/A</a> <a href="https://example.com/post">[link]</a> <a href="https://example.com/post">[comments]</a></td></tr></table>"#;
+        let out = render_clean_html(html, 80);
+        // No reference markers anywhere.
+        assert!(
+            !out.contains("][1]") && !out.contains("][2]") && !out.contains("][3]"),
+            "expected no `][N]` link markers in:\n{out}"
+        );
+        // No footnote dump.
+        assert!(
+            !out.contains("[1]:") && !out.contains("[2]:"),
+            "expected no `[N]: url` footnotes in:\n{out}"
+        );
+        // No `|` column artifacts from the table.
+        assert!(
+            !out.contains('|'),
+            "expected no column separators in:\n{out}"
+        );
+        // Anchor inner text is preserved.
+        assert!(out.contains("Excuse me?! What??"));
+        assert!(out.contains("/u/A"));
+        // Emphasis is preserved (this is what distinguishes us from
+        // html2text's TrivialDecorator, which would strip the `*`s).
+        assert!(
+            out.contains("*suggestive*"),
+            "expected `<em>` to render as `*...*` in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_clean_html_strips_image_with_empty_alt() {
+        // An image with no alt/title should render as `[]` (PlainDecorator
+        // behavior we inherit) rather than disappearing — the user still
+        // gets a visible hint that something was there.
+        let html = r#"<p>Before <img src="https://example.com/x.png"/> after.</p>"#;
+        let out = render_clean_html(html, 80);
+        assert!(out.contains("Before"));
+        assert!(out.contains("after."));
+    }
 }

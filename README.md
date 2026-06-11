@@ -25,6 +25,7 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Article Preview**: Toggle an inline preview pane in the dashboard view, or have it open at launch with `show_preview = true`
 - **Link Extraction**: Extract and browse all links from an article with `l`
 - **Full-Text Extraction**: Strip away summaries and read the actual article content inline via Mozilla Readability — manual on `Shift+F`, or auto-extract on refresh per feed with `fulltext = true`
+- **Inline Images**: When an article has a `<media:thumbnail>` (e.g. YouTube channel feeds, web-comic RSS), Feedr renders it inline in the detail view via the Kitty graphics protocol. Auto-detected on Ghostty, Kitty, and WezTerm; silently no-ops elsewhere. Images are fetched in the background — read or open in browser without waiting.
 - **Help Overlay**: Press `?` for a scrollable keybinding reference overlay
 - **OPML Import**: Bulk import feeds from OPML files via `feedr --import <file.opml>`
 - **Browser Integration**: Open articles in your default browser
@@ -361,7 +362,12 @@ Expanded in every `argv` token of macro and hook commands:
 | `%d` | Formatted publish date |
 | `%f` | Feed title |
 | `%F` | Feed URL |
+| `%m` | Primary media URL (`<media:content>`, `<enclosure>`, or Atom `<content src>`) |
+| `%M` | MIME type of the primary media |
+| `%i` | First `<media:thumbnail>` URL on the item |
 | `%%` | Literal `%` |
+
+`%m`/`%M`/`%i` expand to the empty string when an item has no media — they're **orthogonal** to `%u` (no fallback). For YouTube channel feeds the watch-page URL is `%u`; the in-feed video URL is `%m`. For RSS podcasts the episode page is `%u`; the audio file is `%m`.
 
 #### Macros
 
@@ -372,6 +378,12 @@ A macro binds a key to an ordered chain of steps. Trigger with `<prefix><key>` (
 y = 'open-in-browser ; pipe-to "yt-dlp %u"'
 w = 'pipe-to "wallabag-cli add %u" -- "Save to Wallabag"'
 n = 'pipe-to "tee /tmp/out.txt" stdin=metadata'
+
+# Media-rich feeds (YouTube channels, web comics, podcasts):
+v = 'exec "mpv %u" -- "Play in mpv"'         # YouTube: mpv resolves the watch URL via yt-dlp
+d = 'exec "yt-dlp -o ~/Videos/%(title)s.%(ext)s %u" -- "Download with yt-dlp"'
+p = 'exec "mpv %m" -- "Play media file"'     # Podcasts: direct .mp3 URL is %m
+i = 'exec "feh %i" -- "View thumbnail"'      # Web comics / YT thumbnails
 
 [macro_options]
 prefix = ","                  # the macro-prefix key

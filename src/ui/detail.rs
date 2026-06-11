@@ -2,7 +2,6 @@ use crate::app::{find_article_matches, App, ArticleMatch, ExtractionState, Input
 use crate::keybindings::{key_display, KeyAction};
 use crate::ui::utils::{count_wrapped_lines, format_content_for_reading, truncate_url};
 use crate::ui::ColorScheme;
-use html2text::from_read;
 use ratatui::{
     backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -41,29 +40,82 @@ pub(super) fn render_item_detail<B: Backend>(
     // suffix all agree on visibility.
     let search_footer_visible =
         matches!(app.input_mode, InputMode::ArticleSearch) || !app.article_search_query.is_empty();
-    if let Some(item) = app.current_item() {
-        // Split the area into header, content, and (optionally) a 1-row
-        // search footer. The footer is omitted when in-article search is
-        // inactive so quiet reading is unchanged.
-        let chunks = if search_footer_visible {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(9), // Header
-                    Constraint::Min(0),    // Content
-                    Constraint::Length(1), // Search footer
-                ])
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(9), // Header
-                    Constraint::Min(0),    // Content
-                ])
-                .split(area)
-        };
+    // ── Image strip setup (hoisted above the `current_item` borrow) ─────
+    // We extract the thumbnail URL with a short-lived immutable borrow,
+    // then release it so we can mutate `app.image_cache` and write to
+    // `app.pending_image_render` below. The actual layout decision needs
+    // the URL string, which we own here.
+    let image_url: Option<String> = app.current_item().and_then(|i| i.thumbnail.clone());
+    let image_strip_rows: u16 = match &image_url {
+        Some(url)
+            if app.image_cache.has_image(url)
+                && app.image_cache.protocol() == crate::image::ImageProtocol::Kitty =>
+        {
+            // 10 rows is a reasonable thumbnail size on a typical
+            // terminal: tall enough to show the image content, short
+            // enough to leave room for the body below.
+            10
+        }
+        _ => 0,
+    };
+    // Queue a background fetch on first display of an item with a
+    // thumbnail. `start_fetch` is idempotent for already-attempted URLs,
+    // so re-rendering the same detail view is cheap.
+    if let Some(url) = &image_url {
+        app.image_cache.start_fetch(url);
+    }
+    // Split the area into header, optional image strip, content, and
+    // (optionally) a 1-row search footer. The footer is omitted when
+    // in-article search is inactive so quiet reading is unchanged. The
+    // split happens before the `item` borrow below so the *actual* strip
+    // rect can be stored in `pending_image_render`.
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(9)]; // Header
+    if image_strip_rows > 0 {
+        constraints.push(Constraint::Length(image_strip_rows));
+    }
+    constraints.push(Constraint::Min(0)); // Content
+    if search_footer_visible {
+        constraints.push(Constraint::Length(1));
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    // Resolve chunk indices: header is always [0]; image strip (if
+    // present) is [1] and shifts content/footer down by one.
+    let content_chunk_idx: usize = if image_strip_rows > 0 { 2 } else { 1 };
+    let footer_chunk_idx: Option<usize> = if search_footer_visible {
+        Some(if image_strip_rows > 0 { 3 } else { 2 })
+    } else {
+        None
+    };
 
+    // Compute the pending image rect from the strip chunk the layout
+    // solver actually produced — on short terminals it can be squeezed
+    // below the requested rows, and the image must not spill past it
+    // onto the content or help bar. The image is horizontally centered
+    // within the strip. None when no strip is shown or it collapsed.
+    app.pending_image_render = match (&image_url, image_strip_rows > 0) {
+        (Some(url), true) => {
+            let strip = chunks[1];
+            if strip.width == 0 || strip.height == 0 {
+                None
+            } else {
+                app.image_cache
+                    .display_cells(url, strip.width as usize, strip.height as usize)
+                    .map(|(cols, rows)| crate::app::PendingImage {
+                        url: url.clone(),
+                        col: strip.x + strip.width.saturating_sub(cols) / 2,
+                        row: strip.y,
+                        cols,
+                        rows,
+                    })
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(item) = app.current_item() {
         // Create header with enhanced typography
         let mut header_lines = vec![
             // Title with better emphasis
@@ -153,6 +205,12 @@ pub(super) fn render_item_detail<B: Backend>(
             .alignment(Alignment::Left);
 
         f.render_widget(header, chunks[0]);
+        // The image strip (chunks[1], if present) is intentionally NOT
+        // rendered into — the cells stay blank so the Kitty escapes
+        // emitted after `terminal.draw()` returns paint the image on
+        // top, and ratatui's diff sees no changes there on subsequent
+        // frames (image persists). The target rect was already stored in
+        // `app.pending_image_render` before the item-borrow began.
 
         // Decide which body to render: the original summary, the extracted
         // full-text, or a placeholder for in-flight / failed extractions.
@@ -181,7 +239,7 @@ pub(super) fn render_item_detail<B: Backend>(
         // duplicated when extraction fails and we fall back to the summary.
         let summary_text = || -> String {
             if let Some(desc) = &item.description {
-                let raw_text = from_read(desc.as_bytes(), 100);
+                let raw_text = crate::ui::utils::render_clean_html(desc, 100);
                 format_content_for_reading(&raw_text)
             } else {
                 "No description available".to_string()
@@ -221,13 +279,13 @@ pub(super) fn render_item_detail<B: Backend>(
         };
 
         // Calculate the viewport height (accounting for borders and padding)
-        let viewport_height = chunks[1]
+        let viewport_height = chunks[content_chunk_idx]
             .height
             .saturating_sub(2) // borders (top and bottom)
             .saturating_sub(4); // increased padding (top and bottom)
 
         // Calculate the content width (accounting for borders and padding)
-        let content_width = chunks[1]
+        let content_width = chunks[content_chunk_idx]
             .width
             .saturating_sub(2) // borders (left and right)
             .saturating_sub(8) // increased padding for better reading width
@@ -359,10 +417,10 @@ pub(super) fn render_item_detail<B: Backend>(
             .wrap(Wrap { trim: true })
             .alignment(Alignment::Left);
 
-        f.render_widget(content, chunks[1]);
+        f.render_widget(content, chunks[content_chunk_idx]);
 
-        if search_footer_visible {
-            render_search_footer(f, app, chunks[2], colors);
+        if let Some(idx) = footer_chunk_idx {
+            render_search_footer(f, app, chunks[idx], colors);
         }
     }
 }

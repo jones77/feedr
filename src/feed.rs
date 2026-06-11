@@ -38,6 +38,48 @@ pub struct Feed {
     pub title_lower: String,
 }
 
+/// Coarse classification of a media attachment, derived from its MIME type's
+/// top-level type. Used by `FeedItem::primary_media` to prefer playable media
+/// (audio/video) over decorative (image) when picking the item's primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    Audio,
+    Video,
+    Image,
+    Unknown,
+}
+
+impl MediaKind {
+    fn from_mime(mime: Option<&str>) -> Self {
+        match mime {
+            Some(m) if m.starts_with("audio/") => Self::Audio,
+            Some(m) if m.starts_with("video/") => Self::Video,
+            Some(m) if m.starts_with("image/") => Self::Image,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A single playable / viewable media URL attached to a feed item. Sourced
+/// from RSS Media (`<media:content>`), RSS 2 enclosures (`<enclosure>`), or
+/// Atom out-of-line content (`<content src="…">`). Surfaced to macro
+/// placeholders via `%m` / `%M`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MediaAttachment {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    pub kind: MediaKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FeedItem {
     pub title: String,
@@ -52,6 +94,28 @@ pub struct FeedItem {
     pub plain_text: Option<String>,
     #[serde(skip)]
     pub title_lower: String,
+    /// Media attachments parsed from `<media:content>`, `<enclosure>`, and
+    /// Atom out-of-line `<content src="…">`. Empty for ordinary text feeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaAttachment>,
+    /// First `<media:thumbnail>` URI on the entry, if any. Independent of
+    /// `media` — a YouTube entry typically has both a video attachment and
+    /// a thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+}
+
+impl FeedItem {
+    /// Pick the most "playable" media attachment for placeholder expansion.
+    /// Audio/video win over images; images win over Unknown. Within a tier
+    /// the first (feed-order) attachment wins.
+    pub fn primary_media(&self) -> Option<&MediaAttachment> {
+        self.media
+            .iter()
+            .find(|m| matches!(m.kind, MediaKind::Audio | MediaKind::Video))
+            .or_else(|| self.media.iter().find(|m| m.kind == MediaKind::Image))
+            .or_else(|| self.media.first())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -750,13 +814,24 @@ impl FeedItem {
                 .map(|summary| summary.content.clone())
         };
 
-        // Cache plain text from description (avoids repeated HTML parsing)
-        let plain_text = description
-            .as_ref()
-            .map(|desc| html2text::from_read(desc.as_bytes(), 80));
+        // Cache plain text from description (avoids repeated HTML parsing).
+        // Table structure is flattened first — see `flatten_description_html`
+        // for why (Reddit RSS in particular wraps metadata in a 2-column
+        // table that html2text would otherwise render with `|` separators).
+        let plain_text = description.as_ref().map(|desc| {
+            let prepped = flatten_description_html(desc);
+            html2text::from_read(prepped.as_bytes(), 80)
+        });
 
         // Extract the primary link
         let link = entry.links.first().map(|link| link.href.clone());
+
+        // Extract media attachments and thumbnails. Three sources, in priority
+        // order (first occurrence of a given URL wins after dedup):
+        //   1. <media:content> from RSS Media (`entry.media[*].content[*]`)
+        //   2. <enclosure> from RSS 2 (links with `rel == Some("enclosure")`)
+        //   3. Atom out-of-line `<content src="…">`
+        let (media, thumbnail) = extract_media(entry);
 
         let title = entry
             .title
@@ -775,8 +850,206 @@ impl FeedItem {
             parsed_date,
             plain_text,
             title_lower,
+            media,
+            thumbnail,
         }
     }
+}
+
+/// Walk a `feed_rs::model::Entry` and collect media attachments + a single
+/// representative thumbnail. See `FeedItem::from_feed_entry` for source
+/// priority. URL deduplication preserves first occurrence.
+fn extract_media(entry: &feed_rs::model::Entry) -> (Vec<MediaAttachment>, Option<String>) {
+    let mut media: Vec<MediaAttachment> = Vec::new();
+    let mut seen_urls: HashSet<String> = HashSet::new();
+    let push = |att: MediaAttachment, seen: &mut HashSet<String>, media: &mut Vec<_>| {
+        if seen.insert(att.url.clone()) {
+            media.push(att);
+        }
+    };
+
+    // 1. <media:content> via media:group or default item-level grouping.
+    for obj in &entry.media {
+        for content in &obj.content {
+            let Some(url) = content.url.as_ref() else {
+                continue;
+            };
+            let mime = content
+                .content_type
+                .as_ref()
+                .map(|t| t.essence().to_string());
+            let att = MediaAttachment {
+                url: url.to_string(),
+                kind: MediaKind::from_mime(mime.as_deref()),
+                mime,
+                width: content.width,
+                height: content.height,
+                duration_secs: content.duration.map(|d| d.as_secs()),
+                size_bytes: content.size,
+            };
+            push(att, &mut seen_urls, &mut media);
+        }
+    }
+
+    // 2. RSS 2 <enclosure>: feed-rs lands these in entry.links with rel="enclosure".
+    for link in &entry.links {
+        if link.rel.as_deref() != Some("enclosure") {
+            continue;
+        }
+        let mime = link.media_type.clone();
+        let att = MediaAttachment {
+            url: link.href.clone(),
+            kind: MediaKind::from_mime(mime.as_deref()),
+            mime,
+            width: None,
+            height: None,
+            duration_secs: None,
+            size_bytes: link.length,
+        };
+        push(att, &mut seen_urls, &mut media);
+    }
+
+    // 3. Atom out-of-line <content src="…">. The content's media type is on the
+    // parent `Content`, not on the inner `Link`.
+    if let Some(content) = entry.content.as_ref() {
+        if let Some(src) = content.src.as_ref() {
+            let mime = Some(content.content_type.essence().to_string());
+            let att = MediaAttachment {
+                url: src.href.clone(),
+                kind: MediaKind::from_mime(mime.as_deref()),
+                mime,
+                width: None,
+                height: None,
+                duration_secs: None,
+                size_bytes: content.length,
+            };
+            push(att, &mut seen_urls, &mut media);
+        }
+    }
+
+    // Thumbnail priority:
+    //   1. <media:thumbnail> on the entry (Reddit, YouTube, etc.)
+    //   2. First <img src="..."> in the entry's content / summary HTML
+    //      (xkcd, SMBC, Penny Arcade — comic feeds that put their single
+    //      image inside the summary instead of a media namespace).
+    let thumbnail = entry
+        .media
+        .iter()
+        .flat_map(|obj| obj.thumbnails.iter())
+        .map(|t| t.image.uri.clone())
+        .find(|uri| !uri.is_empty())
+        .or_else(|| {
+            // Fall back to scraping the description for an <img>. We try
+            // `content` first (which `from_feed_entry` already prefers over
+            // `summary`), then `summary`. Resolution uses the first entry
+            // link as base so `src="/comics/foo.png"` becomes absolute.
+            let base = entry.links.first().map(|l| l.href.as_str());
+            let html_sources = [
+                entry.content.as_ref().and_then(|c| c.body.as_deref()),
+                entry.summary.as_ref().map(|s| s.content.as_str()),
+            ];
+            html_sources
+                .into_iter()
+                .flatten()
+                .find_map(|html| extract_first_image_url(html, base))
+        });
+
+    (media, thumbnail)
+}
+
+/// Find the first `<img src="...">` URL in an HTML fragment. Relative URLs
+/// are resolved against `base_url` if provided. Returns None on parse
+/// failure, missing `src`, empty `src`, or `data:` / `javascript:` URIs.
+fn extract_first_image_url(html: &str, base_url: Option<&str>) -> Option<String> {
+    let doc = Html::parse_fragment(html);
+    let selector = Selector::parse("img[src]").ok()?;
+    let base = base_url.and_then(|u| Url::parse(u).ok());
+    for el in doc.select(&selector) {
+        let src = el.value().attr("src")?.trim();
+        if src.is_empty() {
+            continue;
+        }
+        // Skip tracking pixels / spacers: FeedBurner-style feeds lead with
+        // a 1x1 beacon that would otherwise win as "the" thumbnail. Only
+        // declared-tiny images are skipped — missing attributes pass.
+        let is_tiny = |attr: &str| {
+            el.value()
+                .attr(attr)
+                .and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok())
+                .is_some_and(|n| n <= 2)
+        };
+        if is_tiny("width") || is_tiny("height") {
+            continue;
+        }
+        // Reject inline-data and unsupported schemes outright — we'd just
+        // fail to fetch them and burn a slot.
+        let lower = src.to_ascii_lowercase();
+        if lower.starts_with("data:") || lower.starts_with("javascript:") {
+            continue;
+        }
+        let resolved = if let Some(b) = &base {
+            b.join(src)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| src.to_string())
+        } else {
+            src.to_string()
+        };
+        // Only http(s); ignore protocol-less or file:// URIs.
+        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// Pre-process feed-description HTML to flatten `<table>` structures into
+/// inline text before handing it to `html2text`. Reddit RSS posts (and many
+/// other feeds) wrap title/author/link metadata in a 2-column HTML table;
+/// html2text faithfully renders that as box-drawn columns with `|`
+/// separators, which then mangles badly when the downstream
+/// `format_content_for_reading` paragraph-joins the rows. Cell boundaries
+/// become spaces, row ends emit `<br><br>` (a paragraph break — needed so
+/// the blank line survives the line-joining pass), and the table/tbody/
+/// thead/tfoot wrappers are dropped. Tag matching is case-insensitive and
+/// tolerates attributes. Non-table markup is left intact.
+pub(crate) fn flatten_description_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let Some(lt_idx) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..lt_idx]);
+        let after_lt = &rest[lt_idx..];
+        let Some(gt_rel) = after_lt.find('>') else {
+            // Unterminated tag — emit the rest verbatim and stop.
+            out.push_str(after_lt);
+            break;
+        };
+        let tag = &after_lt[..=gt_rel];
+        let body = &tag[1..tag.len() - 1];
+        let body_after_slash = body.strip_prefix('/').unwrap_or(body);
+        let name_end = body_after_slash
+            .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .unwrap_or(body_after_slash.len());
+        let name_lower = body_after_slash[..name_end].to_ascii_lowercase();
+        match name_lower.as_str() {
+            "table" | "tbody" | "thead" | "tfoot" | "colgroup" | "col" | "caption" => {
+                // Drop the wrapper — keep inner content inline.
+            }
+            "tr" => {
+                // Close any preceding row content with a paragraph break.
+                // We emit on both `<tr>` and `</tr>`; doubled `<br>`s
+                // collapse into a single paragraph break in html2text.
+                out.push_str("<br><br>");
+            }
+            "td" | "th" => out.push(' '),
+            _ => out.push_str(tag),
+        }
+        rest = &after_lt[gt_rel + 1..];
+    }
+    out
 }
 
 fn format_date(dt: DateTime<Utc>) -> String {
@@ -799,6 +1072,74 @@ fn format_date(dt: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_strips_reddit_style_table() {
+        // Reddit RSS wraps each post in a 2-column table; html2text would
+        // otherwise render that with `|` column separators that mangle on
+        // re-wrap. After flattening: cells joined by spaces, row ends are
+        // paragraph breaks, table wrappers gone, inner anchors intact.
+        let html = r#"<table><tr><td><a href="https://i.redd.it/x.jpg"><img src="https://i.redd.it/x.jpg"/></a></td><td>&#32;submitted by <a href="https://www.reddit.com/user/poorzack">/u/poorzack</a> <br/> <a href="https://i.redd.it/x.jpg">[link]</a> <a href="https://www.reddit.com/r/manga/comments/1tearp5/">[comments]</a></td></tr></table>"#;
+        let out = flatten_description_html(html);
+        assert!(!out.contains("<table"));
+        assert!(!out.contains("</table"));
+        assert!(!out.contains("<tr"));
+        assert!(!out.contains("</tr"));
+        assert!(!out.contains("<td"));
+        assert!(!out.contains("</td"));
+        // Inner anchors / hrefs survive untouched so html2text still
+        // renders them as reference-style links.
+        assert!(out.contains(r#"<a href="https://www.reddit.com/user/poorzack">"#));
+        assert!(out.contains("/u/poorzack"));
+        // Row ends emit a paragraph break.
+        assert!(out.contains("<br><br>"));
+    }
+
+    #[test]
+    fn flatten_is_case_insensitive_and_tolerates_attributes() {
+        let html =
+            r#"<TABLE class="foo"><TR id="x"><TD style="a:b">one</TD><Th>two</Th></TR></TABLE>"#;
+        let out = flatten_description_html(html);
+        assert!(!out.to_ascii_lowercase().contains("<table"));
+        assert!(!out.to_ascii_lowercase().contains("<tr"));
+        assert!(!out.to_ascii_lowercase().contains("<td"));
+        assert!(!out.to_ascii_lowercase().contains("<th"));
+        assert!(out.contains("one"));
+        assert!(out.contains("two"));
+    }
+
+    #[test]
+    fn flatten_preserves_non_table_markup() {
+        let html = r#"<p>Hello <a href="x">link</a> world.</p><ul><li>one</li><li>two</li></ul>"#;
+        let out = flatten_description_html(html);
+        // Nothing in this string is table markup, so byte-equal.
+        assert_eq!(out, html);
+    }
+
+    #[test]
+    fn flatten_handles_unterminated_tag() {
+        // Don't panic on malformed HTML; just emit it verbatim from the
+        // unterminated `<` onward.
+        let html = "before <table no-close";
+        let out = flatten_description_html(html);
+        assert!(out.contains("before "));
+        assert!(out.contains("<table no-close"));
+    }
+
+    #[test]
+    fn flatten_no_pipe_column_artifacts_after_html2text() {
+        // End-to-end on a minimal Reddit-style table: piping the flattened
+        // HTML through html2text must not produce the `|`-column rendering
+        // that's the whole reason this preprocessing exists.
+        let html = r#"<table><tr><td><a href="https://example.com/img.jpg">img</a></td><td>Title here <a href="https://example.com/post">[link]</a></td></tr></table>"#;
+        let prepped = flatten_description_html(html);
+        let text = html2text::from_read(prepped.as_bytes(), 80);
+        assert!(
+            !text.contains('|'),
+            "expected no column separators in flattened output, got:\n{text}"
+        );
+        assert!(text.contains("Title here"));
+    }
 
     #[test]
     fn test_discover_single_rss_feed() {
@@ -1416,5 +1757,298 @@ mod tests {
             "expected a GET request, got: {}",
             request
         );
+    }
+
+    // ── media extraction ─────────────────────────────────────────────────────
+
+    fn parse_first_entry(xml: &str) -> feed_rs::model::Entry {
+        let feed = feed_rs::parser::parse(xml.as_bytes()).expect("parse feed");
+        feed.entries.into_iter().next().expect("at least one entry")
+    }
+
+    #[test]
+    fn media_extract_youtube_atom_shape() {
+        // YouTube's channel feeds wrap the video in <media:group> with a
+        // <media:content url="…"> and a <media:thumbnail url="…">.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/">
+  <id>yt:channel:UCexample</id>
+  <title>Example Channel</title>
+  <entry>
+    <id>yt:video:abc123</id>
+    <title>Example Video</title>
+    <link href="https://www.youtube.com/watch?v=abc123"/>
+    <published>2025-01-01T00:00:00+00:00</published>
+    <media:group>
+      <media:title>Example Video</media:title>
+      <media:content url="https://www.youtube.com/v/abc123" type="application/x-shockwave-flash" width="640" height="390"/>
+      <media:thumbnail url="https://i.ytimg.com/vi/abc123/hqdefault.jpg" width="480" height="360"/>
+      <media:description>Some description.</media:description>
+    </media:group>
+  </entry>
+</feed>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(item.media.len(), 1, "expected exactly one media attachment");
+        assert_eq!(item.media[0].url, "https://www.youtube.com/v/abc123");
+        assert_eq!(
+            item.media[0].mime.as_deref(),
+            Some("application/x-shockwave-flash")
+        );
+        assert_eq!(item.media[0].kind, MediaKind::Unknown);
+        assert_eq!(item.media[0].width, Some(640));
+        assert_eq!(item.media[0].height, Some(390));
+        assert_eq!(
+            item.thumbnail.as_deref(),
+            Some("https://i.ytimg.com/vi/abc123/hqdefault.jpg")
+        );
+    }
+
+    #[test]
+    fn media_extract_rss_enclosure() {
+        // RSS 2 podcast: <enclosure> lands in entry.links with rel="enclosure".
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Podcast</title>
+    <link>https://podcast.example.com/</link>
+    <description>A podcast.</description>
+    <item>
+      <title>Episode 1</title>
+      <link>https://podcast.example.com/ep1</link>
+      <guid>https://podcast.example.com/ep1</guid>
+      <enclosure url="https://podcast.example.com/ep1.mp3" length="12345678" type="audio/mpeg"/>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(item.media.len(), 1);
+        assert_eq!(item.media[0].url, "https://podcast.example.com/ep1.mp3");
+        assert_eq!(item.media[0].kind, MediaKind::Audio);
+        assert_eq!(item.media[0].mime.as_deref(), Some("audio/mpeg"));
+        assert_eq!(item.media[0].size_bytes, Some(12_345_678));
+        assert!(item.thumbnail.is_none());
+    }
+
+    #[test]
+    fn media_extract_atom_content_src() {
+        // Atom out-of-line <content src="…" type="video/mp4"/>.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>tag:example.com,2025:feed</id>
+  <title>Example</title>
+  <entry>
+    <id>tag:example.com,2025:1</id>
+    <title>A Video</title>
+    <link href="https://example.com/post"/>
+    <content type="video/mp4" src="https://cdn.example.com/clip.mp4"/>
+  </entry>
+</feed>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(item.media.len(), 1);
+        assert_eq!(item.media[0].url, "https://cdn.example.com/clip.mp4");
+        assert_eq!(item.media[0].kind, MediaKind::Video);
+        assert_eq!(item.media[0].mime.as_deref(), Some("video/mp4"));
+    }
+
+    #[test]
+    fn media_dedup_across_sources() {
+        // Same URL in both <media:content> and <enclosure> should produce one
+        // attachment, keeping the Media RSS metadata (which lands first).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>Test</title>
+    <link>https://example.com/</link>
+    <description>x</description>
+    <item>
+      <title>Dup</title>
+      <link>https://example.com/ep1</link>
+      <guid>https://example.com/ep1</guid>
+      <media:content url="https://example.com/ep1.mp3" type="audio/mpeg" duration="120"/>
+      <enclosure url="https://example.com/ep1.mp3" length="999" type="audio/mp4"/>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(item.media.len(), 1, "duplicate URL should collapse");
+        // First-source wins: the media:content MIME, not the enclosure MIME.
+        assert_eq!(item.media[0].mime.as_deref(), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn media_primary_picks_audio_video_over_image() {
+        let item = FeedItem {
+            title: "t".into(),
+            link: None,
+            description: None,
+            pub_date: None,
+            author: None,
+            formatted_date: None,
+            parsed_date: None,
+            plain_text: None,
+            title_lower: "t".into(),
+            media: vec![
+                MediaAttachment {
+                    url: "https://x/thumb.jpg".into(),
+                    mime: Some("image/jpeg".into()),
+                    kind: MediaKind::Image,
+                    width: None,
+                    height: None,
+                    duration_secs: None,
+                    size_bytes: None,
+                },
+                MediaAttachment {
+                    url: "https://x/clip.mp4".into(),
+                    mime: Some("video/mp4".into()),
+                    kind: MediaKind::Video,
+                    width: None,
+                    height: None,
+                    duration_secs: None,
+                    size_bytes: None,
+                },
+            ],
+            thumbnail: None,
+        };
+        let primary = item.primary_media().expect("has primary");
+        assert_eq!(primary.kind, MediaKind::Video);
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_img_in_summary() {
+        // xkcd-style: <img> inside <summary type="html">.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>https://xkcd.com/</id>
+  <title>xkcd</title>
+  <entry>
+    <id>https://xkcd.com/3246/</id>
+    <title>Speedrun</title>
+    <link href="https://xkcd.com/3246/"/>
+    <summary type="html">&lt;img src="https://imgs.xkcd.com/comics/speedrun.png" alt="..."/&gt;</summary>
+  </entry>
+</feed>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(
+            item.thumbnail.as_deref(),
+            Some("https://imgs.xkcd.com/comics/speedrun.png")
+        );
+        // The media list itself stays empty — no <media:content> or <enclosure>.
+        assert!(item.media.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_prefers_media_thumbnail_over_summary_img() {
+        // When both are present, the explicit <media:thumbnail> wins.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/">
+  <id>x</id>
+  <title>x</title>
+  <entry>
+    <id>x1</id>
+    <title>x</title>
+    <link href="https://example.com/p1"/>
+    <summary type="html">&lt;img src="https://example.com/in-summary.png"/&gt;</summary>
+    <media:thumbnail url="https://example.com/explicit-thumb.jpg"/>
+  </entry>
+</feed>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(
+            item.thumbnail.as_deref(),
+            Some("https://example.com/explicit-thumb.jpg")
+        );
+    }
+
+    #[test]
+    fn thumbnail_resolves_relative_img_against_link() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Comics</title>
+    <link>https://comics.example.com/</link>
+    <description>x</description>
+    <item>
+      <title>Strip 1</title>
+      <link>https://comics.example.com/strip/1</link>
+      <guid>https://comics.example.com/strip/1</guid>
+      <description>&lt;img src="/img/strip-1.png"/&gt; today's strip</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(
+            item.thumbnail.as_deref(),
+            Some("https://comics.example.com/img/strip-1.png")
+        );
+    }
+
+    #[test]
+    fn thumbnail_skips_data_uri_imgs() {
+        // A leading data: URI must be skipped; the second <img> wins.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>x</title>
+    <link>https://example.com/</link>
+    <description>x</description>
+    <item>
+      <title>x</title>
+      <link>https://example.com/p1</link>
+      <guid>https://example.com/p1</guid>
+      <description>&lt;img src="data:image/png;base64,abc"/&gt;&lt;img src="https://example.com/real.png"/&gt;</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(
+            item.thumbnail.as_deref(),
+            Some("https://example.com/real.png")
+        );
+    }
+
+    #[test]
+    fn thumbnail_skips_tracking_pixels() {
+        // A leading 1x1 beacon must be skipped; the real image wins. An
+        // image with no width/height attributes is NOT treated as tiny.
+        let html = r#"<img src="https://feeds.example.com/~r/beacon" width="1" height="1"/><img src="https://example.com/real.png"/>"#;
+        assert_eq!(
+            extract_first_image_url(html, None).as_deref(),
+            Some("https://example.com/real.png")
+        );
+        let html_px = r#"<img src="https://x/spacer.gif" width="1px"/><img src="https://example.com/comic.png" width="740"/>"#;
+        assert_eq!(
+            extract_first_image_url(html_px, None).as_deref(),
+            Some("https://example.com/comic.png")
+        );
+    }
+
+    #[test]
+    fn media_empty_for_plain_text_feed() {
+        // A plain RSS item with no enclosure / media should produce no media.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Blog</title>
+    <link>https://blog.example.com/</link>
+    <description>x</description>
+    <item>
+      <title>Post</title>
+      <link>https://blog.example.com/p1</link>
+      <guid>https://blog.example.com/p1</guid>
+      <description>Plain text post.</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let item = FeedItem::from_feed_entry(&entry);
+        assert!(item.media.is_empty());
+        assert!(item.thumbnail.is_none());
     }
 }
