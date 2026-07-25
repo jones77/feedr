@@ -12,7 +12,10 @@
 //   - FilterMode: all filter-cycling keys (c/t/a/r/s/l/x/Esc)
 //   - SelectDiscoveredFeed: j/k/Enter/Esc
 //   - All text input modes (InsertUrl, SearchMode, CategoryNameInput)
-//   - Detail view: g/G and Ctrl+u/Ctrl+d for scrolling
+//   - Detail view: physical PageUp/PageDown keys, g/G, and Ctrl+u/Ctrl+d
+//     for scrolling (these are always available regardless of config).
+//     Configurable page_up/page_down keybinding actions are dispatched
+//     through key_matches guards below the hardcoded arms.
 
 use crate::app::{
     expand_argv_template, make_pipe_payload, AddFeedResult, App, CategoryAction, InputMode,
@@ -448,6 +451,21 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                         app.selected_item = Some(0);
                     }
                 }
+                _ if app.key_matches(KeyAction::PageUp, &key) => {
+                    if let Some(selected) = app.selected_item {
+                        app.selected_item = Some(selected.saturating_sub(10));
+                        app.reset_preview_scroll();
+                    }
+                }
+                _ if app.key_matches(KeyAction::PageDown, &key) => {
+                    if let Some(selected) = app.selected_item {
+                        let len = app.active_dashboard_items().len();
+                        app.selected_item = Some((selected + 10).min(len.saturating_sub(1)));
+                        app.reset_preview_scroll();
+                    } else if !app.active_dashboard_items().is_empty() {
+                        app.selected_item = Some(0);
+                    }
+                }
                 _ if app.key_matches(KeyAction::Select, &key) => {
                     if let Some(selected) = app.selected_item {
                         let active = app.active_dashboard_items();
@@ -721,6 +739,19 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                         }
                     }
                 }
+                _ if app.key_matches(KeyAction::PageUp, &key) => {
+                    if let Some(selected) = app.selected_item {
+                        app.selected_item = Some(selected.saturating_sub(10));
+                    }
+                }
+                _ if app.key_matches(KeyAction::PageDown, &key) => {
+                    if let Some(selected) = app.selected_item {
+                        if let Some(feed) = app.current_feed() {
+                            let new_sel = (selected + 10).min(feed.items.len().saturating_sub(1));
+                            app.selected_item = Some(new_sel);
+                        }
+                    }
+                }
                 _ if app.key_matches(KeyAction::Select, &key) => {
                     if app.selected_item.is_some() {
                         app.view = View::FeedItemDetail;
@@ -763,18 +794,26 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                 _ => {}
             },
             View::FeedItemDetail => match key.code {
-                // Keep hardcoded: page up/down with Ctrl guard, g/G jump, l for links
-                KeyCode::PageUp | KeyCode::Char('u')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    // Scroll up by a larger amount (10 lines)
+                // Keep hardcoded: physical PageUp/PageDown keys always scroll
+                // regardless of configurable keybinding remapping.
+                KeyCode::PageUp => {
                     app.detail_vertical_scroll = app.detail_vertical_scroll.saturating_sub(10);
                     app.clamp_detail_scroll();
                 }
-                KeyCode::PageDown | KeyCode::Char('d')
+                KeyCode::PageDown => {
+                    let new_scroll = app.detail_vertical_scroll.saturating_add(10);
+                    app.detail_vertical_scroll = new_scroll.min(app.detail_max_scroll);
+                }
+                // Keep hardcoded: Ctrl+u / Ctrl+d for vim-style scrolling
+                KeyCode::Char('u')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    // Scroll down by a larger amount (10 lines), but not past the bottom
+                    app.detail_vertical_scroll = app.detail_vertical_scroll.saturating_sub(10);
+                    app.clamp_detail_scroll();
+                }
+                KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     let new_scroll = app.detail_vertical_scroll.saturating_add(10);
                     app.detail_vertical_scroll = new_scroll.min(app.detail_max_scroll);
                 }
@@ -836,6 +875,17 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                 _ if app.key_matches(KeyAction::ToggleRead, &key) => {
                     handle_toggle_read_current(app);
                 }
+                // Configurable page up/down — these fire when the user has
+                // remapped page_up/page_down (e.g. Space → page_down).
+                // Hardcoded physical PageUp/PageDown keys are caught above.
+                _ if app.key_matches(KeyAction::PageUp, &key) => {
+                    app.detail_vertical_scroll = app.detail_vertical_scroll.saturating_sub(10);
+                    app.clamp_detail_scroll();
+                }
+                _ if app.key_matches(KeyAction::PageDown, &key) => {
+                    let new_scroll = app.detail_vertical_scroll.saturating_add(10);
+                    app.detail_vertical_scroll = new_scroll.min(app.detail_max_scroll);
+                }
                 // In-article find: `/` enters ArticleSearch input mode,
                 // n/N jump between matches (handled here so they're no-ops
                 // when no query is active rather than swallowing the key).
@@ -896,6 +946,20 @@ pub(crate) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) -
                         if selected < starred.len().saturating_sub(1) {
                             app.selected_item = Some(selected + 1);
                         }
+                    } else if !starred.is_empty() {
+                        app.selected_item = Some(0);
+                    }
+                }
+                _ if app.key_matches(KeyAction::PageUp, &key) => {
+                    if let Some(selected) = app.selected_item {
+                        app.selected_item = Some(selected.saturating_sub(10));
+                    }
+                }
+                _ if app.key_matches(KeyAction::PageDown, &key) => {
+                    let starred = app.get_starred_dashboard_items();
+                    if let Some(selected) = app.selected_item {
+                        let new_sel = (selected + 10).min(starred.len().saturating_sub(1));
+                        app.selected_item = Some(new_sel);
                     } else if !starred.is_empty() {
                         app.selected_item = Some(0);
                     }
@@ -1494,6 +1558,7 @@ mod tests {
     use super::*;
     use crate::app::{ExtractedLink, LinkType};
     use crate::feed::{Feed, FeedItem};
+    use crate::keybindings::KeyBinding;
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
@@ -2281,6 +2346,113 @@ mod tests {
         let big_n = make_key(KeyCode::Char('N'), KeyModifiers::SHIFT);
         let _ = handle_key_event(&mut app, big_n).unwrap();
         assert_eq!(app.article_search_current, Some(0));
+    }
+
+    #[test]
+    fn test_page_down_custom_keybinding_in_detail() {
+        // Reproducer: binding Space to page_down and pressing it in the
+        // detail view must scroll down by a page.
+        let mut app = make_detail_app();
+        // Override page_down to include Space (mimics the user's config)
+        app.keybindings.insert(
+            KeyAction::PageDown,
+            vec![
+                KeyBinding::new(KeyCode::Char(' ')),
+                KeyBinding::new(KeyCode::PageDown),
+                KeyBinding::with_ctrl(KeyCode::Char('d')),
+            ],
+        );
+        // Give enough scroll room so the page jump is visible
+        app.detail_max_scroll = 50;
+        app.detail_vertical_scroll = 0;
+
+        let space = make_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, space).unwrap();
+        assert_eq!(
+            app.detail_vertical_scroll, 10,
+            "Space bound to page_down should scroll 10 lines"
+        );
+
+        // Press Space again — should scroll further
+        let _ = handle_key_event(&mut app, space).unwrap();
+        assert_eq!(
+            app.detail_vertical_scroll, 20,
+            "Second Space press should scroll to 20"
+        );
+
+        // Unbound key should not scroll
+        app.detail_vertical_scroll = 0;
+        let x = make_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, x).unwrap();
+        assert_eq!(
+            app.detail_vertical_scroll, 0,
+            "Unbound key must not scroll"
+        );
+    }
+
+    #[test]
+    fn test_detail_page_up_down_physical_keys() {
+        // The physical PageDown/PageUp keys must work in the detail view
+        // without requiring Ctrl (pre-existing bug in the hardcoded arms).
+        let mut app = make_detail_app();
+        app.detail_max_scroll = 50;
+        app.detail_vertical_scroll = 0;
+
+        let pgdn = make_key(KeyCode::PageDown, KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, pgdn).unwrap();
+        assert_eq!(
+            app.detail_vertical_scroll, 10,
+            "PageDown key must scroll without Ctrl"
+        );
+
+        let pgup = make_key(KeyCode::PageUp, KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, pgup).unwrap();
+        assert_eq!(
+            app.detail_vertical_scroll, 0,
+            "PageUp key must scroll up without Ctrl"
+        );
+    }
+
+    #[test]
+    fn test_page_down_in_dashboard() {
+        let mut app = make_test_app();
+        app.view = View::Dashboard;
+        app.selected_item = Some(0);
+        // Populate enough items to have room for page jumps
+        app.keybindings.insert(
+            KeyAction::PageDown,
+            vec![KeyBinding::new(KeyCode::Char(' '))],
+        );
+
+        let space = make_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, space).unwrap();
+        // Dashboard has 3 items: (0,0), (0,1), (1,0)
+        // Jump 10 → clamped to last item (index 2)
+        assert_eq!(app.selected_item, Some(2));
+
+        // PageDown at the end should stay clamped
+        let _ = handle_key_event(&mut app, space).unwrap();
+        assert_eq!(
+            app.selected_item,
+            Some(2),
+            "Should not scroll past the last item"
+        );
+    }
+
+    #[test]
+    fn test_page_up_in_dashboard() {
+        let mut app = make_test_app();
+        app.view = View::Dashboard;
+        app.selected_item = Some(2);
+        app.keybindings.insert(
+            KeyAction::PageUp,
+            vec![KeyBinding::new(KeyCode::Char('x'))],
+        );
+
+        let x = make_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        let _ = handle_key_event(&mut app, x).unwrap();
+        // Jump up 10 → clamped to 0
+        assert_eq!(app.selected_item, Some(0));
     }
 
     #[test]
